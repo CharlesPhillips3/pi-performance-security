@@ -7,10 +7,10 @@ A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with three tabs:
 | ![](screenshot-autolock.png) | ![](screenshot-login.png) | ![](screenshot-clock.png) |
 
 ## Auto-Lock
-- Lock the screen after **N minutes idle**, turn the monitor off N minutes after it locks, and lock before the Pi sleeps.
+- Lock the screen after an idle time you set in **hours and minutes**, turn the monitor off a set time (hours + minutes) after it locks, and lock before the Pi sleeps.
 - **Lock now** button (same as Ctrl+Alt+L).
 - Wayland desktop (labwc / wayfire): uses `swayidle` + `swaylock` (+ `wlopm` for monitor off).
-  X11 desktop: uses `xautolock` + `light-locker`.
+  X11 desktop: uses `light-locker` with the X screensaver timer.
 - Starts at every login. Adds a marked block to `~/.config/labwc/autostart` (the rest of the file is left alone).
 
 ## Login Once

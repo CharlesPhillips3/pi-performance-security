@@ -3,8 +3,8 @@
 Security - auto-lock, log-in-once and clock settings for Raspberry Pi 5.
 
 Tabs:
-  Auto-Lock  - lock the desktop after N idle minutes (swayidle + swaylock on
-               the labwc/wayfire Wayland desktop, xautolock + light-locker on X11)
+  Auto-Lock  - lock the desktop after an idle time in hours + minutes (swayidle +
+               swaylock on labwc/wayfire Wayland, light-locker on X11)
   Login Once - save your username/password in the login keyring (unlocked when
                you log in) and pick which admin commands skip the sudo prompt
   Clock      - timezone, network time, manual date/time, the Pi 5 RTC and
@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "Security"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER = getpass.getuser()
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(HOME, ".config", "pi-security")
@@ -58,7 +58,7 @@ SUDO_PRESETS = [
 
 INFO = {
     "autolock": "Locks the screen after you stop using the mouse and keyboard for "
-                "the number of minutes you choose. Unlock with your normal login password.",
+                "the hours and minutes you choose. Unlock with your normal login password.",
     "screenoff": "Turns the monitor off a while after the lock kicks in, to save "
                  "power and screen life. Moving the mouse turns it back on.",
     "sleep": "Also locks the screen right before the Pi suspends, so nobody "
@@ -309,22 +309,23 @@ class App(tk.Tk):
         box.pack(fill="x")
 
         self.v_auto = tk.BooleanVar(value=self.s["autolock"])
-        self.v_lmin = tk.IntVar(value=self.s["lock_min"])
+        lm, om = int(self.s["lock_min"]), int(self.s["off_min"])
+        self.v_lhr = tk.IntVar(value=lm // 60)
+        self.v_lmin = tk.IntVar(value=lm % 60)
         self.v_off = tk.BooleanVar(value=self.s["screenoff"])
-        self.v_omin = tk.IntVar(value=self.s["off_min"])
+        self.v_ohr = tk.IntVar(value=om // 60)
+        self.v_omin = tk.IntVar(value=om % 60)
         self.v_sleep = tk.BooleanVar(value=self.s["lock_sleep"])
 
         r = ttk.Frame(box); r.pack(fill="x", pady=3)
-        ttk.Checkbutton(r, text="Lock after", variable=self.v_auto).pack(side="left")
-        ttk.Spinbox(r, from_=1, to=240, width=5, textvariable=self.v_lmin).pack(side="left", padx=6)
-        ttk.Label(r, text="minutes idle").pack(side="left")
+        ttk.Checkbutton(r, text="Lock the screen when idle", variable=self.v_auto).pack(side="left")
         self.info_btn(r, "autolock").pack(side="right")
+        self._hm_row(box, "Idle time:", self.v_lhr, self.v_lmin, 24)
 
         r = ttk.Frame(box); r.pack(fill="x", pady=3)
-        ttk.Checkbutton(r, text="Turn the monitor off", variable=self.v_off).pack(side="left")
-        ttk.Spinbox(r, from_=1, to=120, width=5, textvariable=self.v_omin).pack(side="left", padx=6)
-        ttk.Label(r, text="minutes after locking").pack(side="left")
+        ttk.Checkbutton(r, text="Turn the monitor off after locking", variable=self.v_off).pack(side="left")
         self.info_btn(r, "screenoff").pack(side="right")
+        self._hm_row(box, "Wait:", self.v_ohr, self.v_omin, 24)
 
         r = ttk.Frame(box); r.pack(fill="x", pady=3)
         ttk.Checkbutton(r, text="Lock before the Pi goes to sleep", variable=self.v_sleep).pack(side="left")
@@ -341,11 +342,29 @@ class App(tk.Tk):
         self.lock_status.pack(anchor="w")
         self.refresh_lock_status()
 
+    @staticmethod
+    def _hm_row(parent, label, v_h, v_m, max_h):
+        r = ttk.Frame(parent); r.pack(fill="x", pady=(0, 6), padx=(24, 0))
+        ttk.Label(r, text=label, width=10).pack(side="left")
+        ttk.Spinbox(r, from_=0, to=max_h, width=4, textvariable=v_h).pack(side="left")
+        ttk.Label(r, text="hours").pack(side="left", padx=(4, 12))
+        ttk.Spinbox(r, from_=0, to=59, width=4, textvariable=v_m).pack(side="left")
+        ttk.Label(r, text="minutes").pack(side="left", padx=4)
+
+    def _total_min(self, v_h, v_m):
+        """Hours + minutes from the boxes, as whole minutes (at least 1)."""
+        return max(1, int(v_h.get()) * 60 + int(v_m.get()))
+
+    @staticmethod
+    def _fmt(mins):
+        h, m = divmod(mins, 60)
+        return " ".join(x for x in (f"{h} h" if h else "", f"{m} min" if m else "") if x)
+
     def refresh_lock_status(self):
         if session_type() == "wayland":
             need = ["swayidle", "swaylock"]
         else:
-            need = ["xautolock", "light-locker"]
+            need = ["light-locker", "xset"]
         missing = [p for p in need if not have(p)]
         running = run(["pgrep", "-u", USER, "-x", need[0]])[0] == 0
         lines = [f"Desktop session: {session_type()}  (uses {need[0]} + {need[1]})"]
@@ -354,7 +373,7 @@ class App(tk.Tk):
         self.lock_status.config(text="\n".join(lines))
 
     def install_tools(self):
-        pk = ["swayidle", "swaylock", "wlopm", "xautolock", "light-locker",
+        pk = ["swayidle", "swaylock", "wlopm", "light-locker", "x11-xserver-utils",
               "libsecret-tools", "gnome-keyring", "libpam-gnome-keyring"]
         if not messagebox.askyesno(APP_NAME, "Install:\n  " + " ".join(pk) + "\n\nwith apt?"):
             return
@@ -366,12 +385,13 @@ class App(tk.Tk):
         self.refresh_lock_status()
 
     def write_idle_script(self):
-        lock_s = max(1, int(self.v_lmin.get())) * 60
-        off_s = lock_s + max(1, int(self.v_omin.get())) * 60
+        lock_s = self._total_min(self.v_lhr, self.v_lmin) * 60
+        off_s = lock_s + self._total_min(self.v_ohr, self.v_omin) * 60
         sh = f"""#!/bin/sh
 # Generated by the Security app - re-written every time you press Apply.
 pkill -u "$USER" -x swayidle 2>/dev/null
 pkill -u "$USER" -x xautolock 2>/dev/null
+pkill -u "$USER" -x light-locker 2>/dev/null
 [ -f "$HOME/.config/pi-security/disabled" ] && exit 0
 if [ -n "$WAYLAND_DISPLAY" ]; then
   exec swayidle -w \\
@@ -383,10 +403,10 @@ if [ -n "$WAYLAND_DISPLAY" ]; then
             sh += "    before-sleep 'swaylock -f -c 1d2430' \\\n"
         sh += f"""    >/dev/null 2>&1
 else
-  xset s off
-  {"xset dpms " + str(off_s) + " " + str(off_s) + " " + str(off_s) if self.v_off.get() else "xset -dpms"}
-  light-locker {"--lock-on-suspend" if self.v_sleep.get() else ""} >/dev/null 2>&1 &
-  exec xautolock -time {max(1, int(self.v_lmin.get()))} -locker 'light-locker-command -l' >/dev/null 2>&1
+  # X screensaver timer drives light-locker (works for any number of hours)
+  xset s {lock_s} 0
+  {"xset +dpms dpms " + str(off_s) + " " + str(off_s) + " " + str(off_s) if self.v_off.get() else "xset -dpms"}
+  exec light-locker --lock-after-screensaver=0 {"--lock-on-suspend" if self.v_sleep.get() else "--no-lock-on-suspend"} >/dev/null 2>&1
 fi
 """
         os.makedirs(os.path.dirname(IDLE_SCRIPT), exist_ok=True)
@@ -434,11 +454,13 @@ fi
 
     def apply_lock(self):
         try:
-            self.s.update(autolock=self.v_auto.get(), lock_min=int(self.v_lmin.get()),
-                          screenoff=self.v_off.get(), off_min=int(self.v_omin.get()),
+            self.s.update(autolock=self.v_auto.get(),
+                          lock_min=self._total_min(self.v_lhr, self.v_lmin),
+                          screenoff=self.v_off.get(),
+                          off_min=self._total_min(self.v_ohr, self.v_omin),
                           lock_sleep=self.v_sleep.get())
         except (tk.TclError, ValueError):
-            messagebox.showerror(APP_NAME, "Minutes must be whole numbers.")
+            messagebox.showerror(APP_NAME, "Hours and minutes must be whole numbers.")
             return
         save_settings(self.s)
         flag = os.path.join(CONF_DIR, "disabled")
@@ -449,12 +471,15 @@ fi
             self.hook_autostart(True)
             subprocess.Popen([IDLE_SCRIPT], start_new_session=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.say(f"Auto-lock on: locks after {self.s['lock_min']} min idle. Starts at every login.")
+            self.say(f"Auto-lock on: locks after {self._fmt(self.s['lock_min'])} idle. Starts at every login.")
         else:
             open(flag, "w").close()
             self.hook_autostart(False)
             run(["pkill", "-u", USER, "-x", "swayidle"])
             run(["pkill", "-u", USER, "-x", "xautolock"])
+            run(["pkill", "-u", USER, "-x", "light-locker"])
+            if session_type() == "x11":
+                run(["xset", "s", "off"])
             self.say("Auto-lock off.")
         self.after(800, self.refresh_lock_status)
 

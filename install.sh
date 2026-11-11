@@ -4,7 +4,7 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "Installing packages (needs sudo once)…"
 sudo apt-get update
-for p in python3-tk swayidle swaylock wlopm xautolock light-locker libsecret-tools gnome-keyring libpam-gnome-keyring; do
+for p in python3-tk swayidle swaylock wlopm light-locker x11-xserver-utils libsecret-tools gnome-keyring libpam-gnome-keyring; do
   sudo apt-get install -y "$p" || echo "  (skipped $p - not available on this OS)"
 done
 sudo install -Dm755 "$DIR/security.py" /opt/pi-security/security.py
