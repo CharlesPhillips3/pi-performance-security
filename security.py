@@ -24,7 +24,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "Pi-Performance / Security"
-VERSION = "1.4.0"
+REPO = "https://github.com/CharlesPhillips3/pi-performance-security"
+SRC_FILE = "/opt/pi-security/source-dir"   # written by install.sh: where the git copy lives
+VERSION = "1.5.0"
 USER = getpass.getuser()
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(HOME, ".config", "pi-security")
@@ -360,6 +362,7 @@ class App(tk.Tk):
         head = ttk.Frame(self, padding=(16, 12, 16, 4))
         head.pack(fill="x")
         ttk.Label(head, text="\U0001F512  Pi-Performance / Security", style="H1.TLabel").pack(side="left")
+        ttk.Button(head, text="⟳ Update app", command=self.update_app).pack(side="right", padx=(8, 0))
         ttk.Label(head, text=f"v{VERSION} · {USER} · {session_type()}",
                   style="Dim.TLabel").pack(side="right")
 
@@ -437,6 +440,44 @@ class App(tk.Tk):
         st.configure("Accent.TButton", background=acc, foreground="white", padding=(12, 5))
         st.map("Accent.TButton", background=[("active", "#a3153c")])
         st.configure("Info.TButton", padding=(2, 0), width=2)
+
+    def update_app(self):
+        """Pull the newest version from GitHub and re-run the installer."""
+        src = read_sys(SRC_FILE)
+        if not src or not os.path.isdir(os.path.join(src, ".git")):
+            src = os.path.join(HOME, "pi-performance-security")
+        if not have("git"):
+            messagebox.showerror(APP_NAME, "git is not installed (sudo apt install git).")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Download the newest version from GitHub and install it?\n\n{REPO}"):
+            return
+        if not self.root_cmd.ensure():
+            return
+
+        def job():
+            if os.path.isdir(os.path.join(src, ".git")):
+                run(["git", "-C", src, "remote", "set-url", "origin", REPO + ".git"])
+                rc, out = run(["git", "-C", src, "pull", "--ff-only"], timeout=180)
+                if rc != 0:  # local edits or odd state: take GitHub's copy
+                    run(["git", "-C", src, "fetch", "origin"], timeout=180)
+                    rc, out = run(["git", "-C", src, "reset", "--hard", "origin/main"], timeout=60)
+            else:
+                rc, out = run(["git", "clone", REPO + ".git", src], timeout=300)
+            if rc != 0:
+                return rc, out
+            rc, out2 = self.root_cmd.run(["bash", os.path.join(src, "install.sh")], timeout=1800)
+            new = re.search(r'^VERSION = "([^"]+)"', read_sys(os.path.join(src, "security.py")), re.M)
+            self._new_ver = new.group(1) if new else "?"
+            return rc, out + "\n" + out2
+
+        def done():
+            v = getattr(self, "_new_ver", None)
+            if v and v != VERSION:
+                if messagebox.askyesno(APP_NAME, f"Updated v{VERSION} → v{v}.\nRestart the app now?"):
+                    os.execv("/usr/local/bin/pi-security", ["pi-security"])
+            elif v:
+                messagebox.showinfo(APP_NAME, f"You already have the newest version (v{v}).")
+        self.bg(job, "Update finished.", "Updating from GitHub… (this can take a few minutes)", after=done)
 
     def info_btn(self, parent, key):
         return ttk.Button(parent, text="i", style="Info.TButton",

@@ -80,12 +80,16 @@ Every setting has an **i** button that explains what it does.
 
 ## Install
 ```bash
-git clone https://github.com/CharlesPhillips3/security.git
-cd security
+git clone https://github.com/CharlesPhillips3/pi-performance-security.git
+cd pi-performance-security
 bash install.sh
 ```
 Open it from **Menu → Preferences → Pi-Performance / Security**, or run `pi-security`.
 Log out and back in once after installing so the keyring unlocks at login.
+
+## Update
+Press **⟳ Update app** at the top right of the app. It downloads the newest version from GitHub, installs it, and offers to restart.
+(From a terminal: `cd pi-performance-security && git pull && bash install.sh`)
 
 ## Uninstall
 ```bash
