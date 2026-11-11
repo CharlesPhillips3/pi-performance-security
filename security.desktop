@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Security
+Comment=Auto-lock, log in once, and clock settings
+Exec=pi-security
+Icon=pi-security
+Terminal=false
+Categories=Settings;System;Security;
