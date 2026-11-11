@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""
+pi-oc-tuner - finds safe CPU and graphics (GPU) overclock settings for a Raspberry Pi 5.
+
+How it stays safe
+  * Every overclock is tried with the Pi 5 "tryboot" feature: the settings go in
+    tryboot.txt and are used for ONE boot only. config.txt is never touched
+    while testing.
+  * The hardware watchdog is switched on while tuning. If a setting freezes or
+    crashes the Pi, the watchdog restarts it and it comes back on normal
+    settings. (If it ever sits frozen at boot, just unplug it and plug it back in.)
+  * A setting only passes if the stress test finishes with no math errors, no
+    crash, no throttling, no under-voltage and stays under 82 C.
+  * The "safe" result is one step BELOW the fastest setting that passed, then
+    both safe values are checked together once more.
+
+Commands (run as root):
+  pi-oc-tuner start [--cpu-only|--gpu-only] [--apply]   begin (reboots the Pi)
+  pi-oc-tuner status                                    print progress as JSON
+  pi-oc-tuner cancel                                    stop and clean up
+  pi-oc-tuner boot                                      (run by systemd at boot)
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+BOOT = "/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot"
+CONFIG = os.path.join(BOOT, "config.txt")
+TRYBOOT = os.path.join(BOOT, "tryboot.txt")
+STATE_DIR = "/var/lib/pi-security"
+STATE = os.path.join(STATE_DIR, "oc-tuner.json")
+LOG = os.path.join(STATE_DIR, "oc-tuner.log")
+WATCHDOG = "/etc/systemd/system.conf.d/pi-oc-watchdog.conf"
+UNIT = "pi-oc-tuner.service"
+BLOCK_B, BLOCK_E = "# >>> pi-security power >>>", "# <<< pi-security power <<<"
+
+CPU_STOCK, GPU_STOCK = 2400, 910
+CPU_LEVELS = [2600, 2700, 2800, 2900, 3000]
+GPU_LEVELS = [1000, 1050, 1100]
+CPU_TEST_S, GPU_TEST_S = 180, 120
+TEMP_LIMIT = 82.0
+MAX_BOOTS = 25
+
+
+# ----------------------------------------------------------------- helpers
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line, flush=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def sh(cmd, timeout=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+    except FileNotFoundError:
+        return 127, f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def vc(*a):
+    rc, out = sh(["vcgencmd", *a], timeout=10)
+    return out.strip() if rc == 0 else ""
+
+
+def temp_c():
+    t = vc("measure_temp")
+    m = re.search(r"([\d.]+)", t)
+    return float(m.group(1)) if m else 0.0
+
+
+def throttled():
+    t = vc("get_throttled")
+    return int(t.split("=")[1], 16) if "=" in t else 0
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE)
+    os.chmod(STATE, 0o644)
+    os.sync()
+
+
+def is_pi5():
+    try:
+        return "Raspberry Pi 5" in open("/proc/device-tree/model").read()
+    except Exception:
+        return False
+
+
+def in_tryboot():
+    """True if this boot used tryboot.txt (Pi 5 bootloader sets this flag)."""
+    p = "/proc/device-tree/chosen/bootloader/tryboot"
+    try:
+        with open(p, "rb") as f:
+            return int.from_bytes(f.read()[:4], "big") == 1
+    except Exception:
+        return None  # unknown on this firmware
+
+
+def strip_block(txt):
+    return re.sub(re.escape(BLOCK_B) + r".*?" + re.escape(BLOCK_E) + r"\n?", "", txt, flags=re.S)
+
+
+def write_tryboot(cpu, gpu):
+    base = strip_block(open(CONFIG).read())
+    if not base.endswith("\n"):
+        base += "\n"
+    lines = ["", "# --- pi-oc-tuner trial (one boot only) ---", "[all]"]
+    if cpu != CPU_STOCK:
+        lines.append(f"arm_freq={cpu}")
+    if gpu != GPU_STOCK:
+        lines.append(f"gpu_freq={gpu}")
+    with open(TRYBOOT, "w") as f:
+        f.write(base + "\n".join(lines) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.sync()
+
+
+def reboot_tryboot():
+    log("Rebooting into the trial settings (tryboot)…")
+    os.sync()
+    rc, out = sh(["systemctl", "reboot", "--reboot-argument=0 tryboot"])
+    if rc != 0:
+        sh(["reboot", "0 tryboot"])
+
+
+def watchdog(on):
+    if on:
+        os.makedirs(os.path.dirname(WATCHDOG), exist_ok=True)
+        with open(WATCHDOG, "w") as f:
+            f.write("# pi-oc-tuner: restart the Pi automatically if a test freezes it\n"
+                    "[Manager]\nRuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n")
+    elif os.path.exists(WATCHDOG):
+        os.remove(WATCHDOG)
+    sh(["systemctl", "daemon-reexec"])
+
+
+def apt_install(*pk):
+    missing = [p for p in pk if not shutil.which({"stress-ng": "stress-ng",
+                                                  "glmark2-es2-drm": "glmark2-es2-drm"}.get(p, p))]
+    if missing:
+        log("Installing test tools: " + " ".join(missing))
+        sh(["apt-get", "update"], timeout=600)
+        sh(["apt-get", "install", "-y", *missing], timeout=900)
+
+
+# ----------------------------------------------------------------- tests
+def watch(proc, seconds):
+    """Watch temperature / throttling while proc runs. Returns (max_temp, flags)."""
+    mx, flags, end = 0.0, set(), time.time() + seconds + 60
+    while proc.poll() is None and time.time() < end:
+        t = temp_c()
+        mx = max(mx, t)
+        th = throttled()
+        if th & 0x1:
+            flags.add("under-voltage")
+        if th & 0x4:
+            flags.add("throttled")
+        if t >= TEMP_LIMIT:
+            flags.add(f"too hot ({t:.0f} C)")
+        time.sleep(2)
+    if proc.poll() is None:
+        proc.kill()
+        flags.add("test hung")
+    return mx, flags
+
+
+def dmesg_mark():
+    rc, out = sh(["dmesg"])
+    return len(out.splitlines())
+
+
+def gpu_errors_since(mark):
+    rc, out = sh(["dmesg"])
+    new = out.splitlines()[mark:]
+    return [l for l in new if re.search(r"v3d|vc4|drm", l, re.I)
+            and re.search(r"error|timeout|hang|reset|fault", l, re.I)]
+
+
+def cpu_test(seconds=CPU_TEST_S):
+    """stress-ng with result checking (--verify catches wrong answers from an unstable CPU)."""
+    if not shutil.which("stress-ng"):
+        return False, {"why": "stress-ng missing"}
+    time.sleep(20)  # let the boot settle
+    p = subprocess.Popen(["stress-ng", "--cpu", "0", "--cpu-method", "all", "--verify",
+                          "--timeout", f"{seconds}s", "--metrics-brief"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    mx, flags = watch(p, seconds)
+    out = p.stdout.read() if p.stdout else ""
+    rc = p.wait()
+    errors = rc != 0 or re.search(r"fail|error|miscompare", out, re.I)
+    ok = not errors and not flags
+    why = "passed" if ok else ", ".join(sorted(flags) + (["calculation errors"] if errors else []))
+    return ok, {"why": why, "max_temp": round(mx, 1)}
+
+
+def gpu_test(seconds=GPU_TEST_S):
+    """glmark2 on the GPU (runs before the desktop starts, so it has the screen to itself)."""
+    exe = shutil.which("glmark2-es2-drm")
+    if not exe:
+        return False, {"why": "glmark2-es2-drm missing"}
+    for _ in range(30):  # wait for the display driver
+        if any(n.startswith("card") for n in os.listdir("/dev/dri")) if os.path.isdir("/dev/dri") else False:
+            break
+        time.sleep(1)
+    time.sleep(10)
+    mark = dmesg_mark()
+    scenes = ["terrain", "refract", "shadow", "jellyfish", "ideas"]
+    per = max(10, seconds // len(scenes))
+    args = [exe, "--annotate"]
+    for sc in scenes:
+        args += ["-b", f"{sc}:duration={per}"]
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    mx, flags = watch(p, seconds + 30)
+    out = p.stdout.read() if p.stdout else ""
+    rc = p.wait()
+    errs = gpu_errors_since(mark)
+    score = re.search(r"glmark2 Score:\s*(\d+)", out)
+    ok = rc == 0 and score and not errs and not flags
+    why = "passed" if ok else ", ".join(sorted(flags) + (["GPU errors"] if errs else [])
+                                        + ([] if score else ["test did not finish"]))
+    return bool(ok), {"why": why, "max_temp": round(mx, 1),
+                      "score": int(score.group(1)) if score else None}
+
+
+# ----------------------------------------------------------------- plan
+def next_trial(s):
+    """Decide the next trial (cpu, gpu, label) or None when finished."""
+    ph = s["phase"]
+    if ph == "baseline":
+        return (CPU_STOCK, GPU_STOCK, "baseline")
+    if ph == "cpu":
+        lv = [l for l in CPU_LEVELS if l > (s["cpu_pass"] or CPU_STOCK)]
+        return (lv[0], GPU_STOCK, "cpu") if lv and not s["cpu_failed"] else None
+    if ph == "gpu":
+        lv = [l for l in GPU_LEVELS if l > (s["gpu_pass"] or GPU_STOCK)]
+        return (CPU_STOCK, lv[0], "gpu") if lv and not s["gpu_failed"] else None
+    if ph == "final":
+        return (s["cpu_safe"], s["gpu_safe"], "final")
+    return None
+
+
+def step_down(levels, stock, best):
+    """One step below the best passing level (the safety margin)."""
+    if not best or best == stock:
+        return stock
+    allv = [stock] + levels
+    i = allv.index(best)
+    return allv[max(0, i - 1)]
+
+
+def advance(s):
+    """Move to the next phase when the current one has no more trials."""
+    while True:
+        tr = next_trial(s)
+        if tr is not None:
+            return tr
+        if s["phase"] == "cpu":
+            s["phase"] = "gpu" if s["do_gpu"] else "final"
+        elif s["phase"] == "gpu":
+            s["phase"] = "final"
+        else:
+            return None
+        if s["phase"] == "final":
+            s["cpu_safe"] = step_down(CPU_LEVELS, CPU_STOCK, s["cpu_pass"]) if s["do_cpu"] else CPU_STOCK
+            s["gpu_safe"] = step_down(GPU_LEVELS, GPU_STOCK, s["gpu_pass"]) if s["do_gpu"] else GPU_STOCK
+            if s["cpu_safe"] == CPU_STOCK and s["gpu_safe"] == GPU_STOCK:
+                s["phase"] = "done"
+                return None
+
+
+def finish(s, note):
+    s["phase"] = "done"
+    s["note"] = note
+    s["pending"] = None
+    s["finished"] = int(time.time())
+    save_state(s)
+    watchdog(False)
+    if os.path.exists(TRYBOOT):
+        os.remove(TRYBOOT)
+    log(f"FINISHED: {note}")
+    if s.get("apply") and (s.get("cpu_safe", CPU_STOCK) != CPU_STOCK or s.get("gpu_safe", GPU_STOCK) != GPU_STOCK):
+        apply_result(s)
+        log("Applied the safe settings to config.txt - rebooting once more to use them.")
+        os.sync()
+        sh(["systemctl", "reboot"])
+
+
+def apply_result(s):
+    txt = strip_block(open(CONFIG).read())
+    if not txt.endswith("\n"):
+        txt += "\n"
+    lines = [BLOCK_B, "[all]", "# Safe overclock found by pi-oc-tuner " + time.strftime("%Y-%m-%d")]
+    if s["cpu_safe"] != CPU_STOCK:
+        lines.append(f"arm_freq={s['cpu_safe']}")
+    if s["gpu_safe"] != GPU_STOCK:
+        lines.append(f"gpu_freq={s['gpu_safe']}")
+    lines.append(BLOCK_E)
+    shutil.copy(CONFIG, CONFIG + ".bak-security")
+    with open(CONFIG, "w") as f:
+        f.write(txt + "\n".join(lines) + "\n")
+    os.sync()
+
+
+def launch(s):
+    tr = advance(s)
+    if tr is None:
+        finish(s, summary(s))
+        return
+    cpu, gpu, label = tr
+    s["pending"] = {"cpu": cpu, "gpu": gpu, "label": label, "started": False}
+    s["boots"] += 1
+    save_state(s)
+    write_tryboot(cpu, gpu)
+    log(f"Next trial: {label}  CPU {cpu} MHz, GPU {gpu} MHz")
+    reboot_tryboot()
+
+
+def summary(s):
+    def mhz(v, stock):
+        return f"{v} MHz" + (" (stock)" if v == stock else "")
+    parts = []
+    if s["do_cpu"]:
+        parts.append(f"CPU safe: {mhz(s.get('cpu_safe', CPU_STOCK), CPU_STOCK)}"
+                     f" (fastest stable {s['cpu_pass'] or CPU_STOCK})")
+    if s["do_gpu"]:
+        parts.append(f"GPU safe: {mhz(s.get('gpu_safe', GPU_STOCK), GPU_STOCK)}"
+                     f" (fastest stable {s['gpu_pass'] or GPU_STOCK})")
+    return " | ".join(parts)
+
+
+def record(s, label, cpu, gpu, ok, info):
+    s["results"].append({"label": label, "cpu": cpu, "gpu": gpu, "ok": ok, **info,
+                         "time": int(time.time())})
+    log(f"{'PASS' if ok else 'FAIL'}  {label}  CPU {cpu}  GPU {gpu}  - {info.get('why')}"
+        f"  max {info.get('max_temp', '?')} C")
+
+
+# ----------------------------------------------------------------- commands
+def cmd_start(args):
+    if os.geteuid() != 0:
+        sys.exit("Run as root (sudo).")
+    if not is_pi5():
+        sys.exit("This tuner is for the Raspberry Pi 5 only.")
+    s = load_state()
+    if s and s.get("phase") not in (None, "done", "cancelled"):
+        sys.exit("A tuning run is already in progress (use 'cancel' first).")
+    do_cpu = "--gpu-only" not in args
+    do_gpu = "--cpu-only" not in args
+    apt_install(*(["stress-ng"] if do_cpu else []), *(["glmark2-es2-drm"] if do_gpu else []))
+    if do_cpu and not shutil.which("stress-ng"):
+        sys.exit("Could not install stress-ng.")
+    if do_gpu and not shutil.which("glmark2-es2-drm"):
+        sys.exit("Could not install glmark2-es2-drm.")
+    if os.path.exists(LOG):
+        os.rename(LOG, LOG + ".old")
+    log("=== Overclock finder started ===")
+    log("Quick cooling check at stock speed (60 s)…")
+    ok, info = cpu_test(60) if do_cpu else (True, {"why": "skipped"})
+    if not ok:
+        log(f"Stock speed already fails: {info['why']}. Fix cooling / power supply first.")
+        save_state({"phase": "done", "note": f"Stopped: at STOCK speed the Pi {info['why']}. "
+                    "Improve cooling (fan/heatsink) or use the official 27 W power supply first.",
+                    "results": [], "do_cpu": do_cpu, "do_gpu": do_gpu,
+                    "cpu_pass": None, "gpu_pass": None})
+        sys.exit(1)
+    s = {"phase": "baseline", "do_cpu": do_cpu, "do_gpu": do_gpu, "apply": "--apply" in args,
+         "cpu_pass": None, "gpu_pass": None, "cpu_failed": False, "gpu_failed": False,
+         "results": [], "boots": 0, "started": int(time.time()), "pending": None,
+         "note": "", "stock_max_temp": info.get("max_temp")}
+    watchdog(True)
+    sh(["systemctl", "enable", UNIT])
+    launch(s)
+
+
+def cmd_boot():
+    s = load_state()
+    if not s or s.get("phase") in ("done", "cancelled", None):
+        return
+    p = s.get("pending")
+    if not p:
+        launch(s)
+        return
+    label, cpu, gpu = p["label"], p["cpu"], p["gpu"]
+    tb = in_tryboot()
+    applied = tb if tb is not None else (vc("get_config", "arm_freq") == f"arm_freq={cpu}"
+                                         if cpu != CPU_STOCK else True)
+    if p["started"] or not applied:
+        why = "crashed / froze during the test" if p["started"] else "didn't boot with this setting"
+        if label == "baseline":
+            finish(s, "Stopped: the test boot didn't work at STOCK settings - tryboot may not be "
+                      "supported by this bootloader. Update it: sudo rpi-eeprom-update -a")
+            return
+        record(s, label, cpu, gpu, False, {"why": why})
+        on_fail(s, label)
+        s["pending"] = None
+        save_state(s)
+        launch(s)
+        return
+    if s["boots"] > MAX_BOOTS:
+        finish(s, "Stopped: too many test reboots.")
+        return
+    # this boot IS the trial - mark started first so a crash is detected next boot
+    p["started"] = True
+    save_state(s)
+    log(f"Testing {label}: CPU {cpu} MHz, GPU {gpu} MHz")
+    results = []
+    if label in ("baseline", "cpu", "final") and s["do_cpu"]:
+        results.append(("cpu",) + cpu_test())
+    if label in ("baseline", "gpu", "final") and s["do_gpu"]:
+        results.append(("gpu",) + gpu_test())
+    ok = all(r[1] for r in results)
+    info = {"why": "; ".join(f"{k}: {r['why']}" for k, _, r in results),
+            "max_temp": max([r.get("max_temp", 0) for _, _, r in results] or [0])}
+    sc = [r.get("score") for k, _, r in results if k == "gpu" and r.get("score")]
+    if sc:
+        info["score"] = sc[0]
+    record(s, label, cpu, gpu, ok, info)
+    s["pending"] = None
+    if label == "baseline":
+        if not ok:
+            gpu_bad = any(k == "gpu" and not o for k, o, _ in results)
+            cpu_bad = any(k == "cpu" and not o for k, o, _ in results)
+            if cpu_bad:
+                finish(s, "Stopped: the stock-speed test failed - fix cooling / power first.")
+                return
+            if gpu_bad:
+                s["do_gpu"] = False
+                s["note"] = "GPU test can't run on this setup (is a monitor plugged in?) - GPU skipped."
+        s["phase"] = "cpu" if s["do_cpu"] else "gpu"
+    elif label == "cpu":
+        if ok:
+            s["cpu_pass"] = cpu
+        else:
+            s["cpu_failed"] = True
+    elif label == "gpu":
+        if ok:
+            s["gpu_pass"] = gpu
+        else:
+            s["gpu_failed"] = True
+    elif label == "final":
+        if ok:
+            finish(s, summary(s))
+            return
+        # combined check failed: back both off one more step and finish
+        s["cpu_safe"] = step_down(CPU_LEVELS, CPU_STOCK, s["cpu_safe"])
+        s["gpu_safe"] = step_down(GPU_LEVELS, GPU_STOCK, s["gpu_safe"])
+        finish(s, summary(s) + "  (backed off one more step after the combined test)")
+        return
+    save_state(s)
+    launch(s)
+
+
+def on_fail(s, label):
+    if label == "cpu":
+        s["cpu_failed"] = True
+    elif label == "gpu":
+        s["gpu_failed"] = True
+    elif label == "final":
+        s["cpu_safe"] = step_down(CPU_LEVELS, CPU_STOCK, s.get("cpu_safe", CPU_STOCK))
+        s["gpu_safe"] = step_down(GPU_LEVELS, GPU_STOCK, s.get("gpu_safe", GPU_STOCK))
+        s["phase"] = "done"
+
+
+def cmd_cancel():
+    s = load_state() or {}
+    s["phase"] = "cancelled"
+    s["pending"] = None
+    s["note"] = "Cancelled."
+    save_state(s)
+    if os.path.exists(TRYBOOT):
+        os.remove(TRYBOOT)
+    watchdog(False)
+    log("Cancelled.")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+    elif a[0] == "start":
+        cmd_start(a[1:])
+    elif a[0] == "boot":
+        s = load_state()
+        if s and s.get("phase") == "done" and s.get("pending") is None:
+            return
+        cmd_boot()
+        s = load_state()
+        if s and s.get("phase") == "done" and not s.get("finished"):
+            finish(s, s.get("note") or summary(s))
+    elif a[0] == "status":
+        print(json.dumps(load_state() or {}, indent=2))
+    elif a[0] == "cancel":
+        cmd_cancel()
+    elif a[0] == "apply":
+        s = load_state()
+        if not s or "cpu_safe" not in s:
+            sys.exit("No result yet.")
+        apply_result(s)
+        print("Applied. Reboot to use them.")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

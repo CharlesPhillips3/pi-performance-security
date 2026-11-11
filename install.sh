@@ -15,6 +15,10 @@ sudo install -Dm755 "$DIR/pi-powerlog" /usr/local/sbin/pi-powerlog
 sudo install -Dm644 "$DIR/pi-powerlog.service" /etc/systemd/system/pi-powerlog.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now pi-powerlog.service
+sudo install -Dm755 "$DIR/pi-oc-tuner" /usr/local/sbin/pi-oc-tuner
+sudo install -Dm644 "$DIR/pi-oc-tuner.service" /etc/systemd/system/pi-oc-tuner.service
+sudo systemctl daemon-reload
+sudo systemctl enable pi-oc-tuner.service   # does nothing unless the Overclock Finder is running
 sudo install -Dm644 "$DIR/security.desktop" /usr/share/applications/pi-security.desktop
 sudo ln -sf /opt/pi-security/security.py /usr/local/bin/pi-security
 sudo gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true

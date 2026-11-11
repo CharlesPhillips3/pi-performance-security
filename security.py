@@ -26,7 +26,7 @@ from tkinter import messagebox, ttk
 APP_NAME = "Pi-Performance / Security"
 REPO = "https://github.com/CharlesPhillips3/pi-performance-security"
 SRC_FILE = "/opt/pi-security/source-dir"   # written by install.sh: where the git copy lives
-VERSION = "1.5.0"
+VERSION = "1.7.0"
 USER = getpass.getuser()
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(HOME, ".config", "pi-security")
@@ -110,10 +110,23 @@ INFO = {
                   "It counts the Pi itself - the CPU, memory, USB and NVMe rails it powers - so it's a "
                   "good estimate, but not the same as a wall-plug meter (it leaves out power supply losses "
                   "and anything with its own power). kWh/day = average watts x 24 / 1000.",
-    "overclock": "Adds arm_freq=2800 (CPU 2.4 to 2.8 GHz) and gpu_freq=1000 to config.txt. "
-                 "Needs a fan / active cooler and the official 27 W power supply. If the "
-                 "Pi won't boot, hold SHIFT at boot or remove those lines from config.txt "
-                 "on another computer. A backup is saved as config.txt.bak-security.",
+    "overclock": "CPU speed sets arm_freq and Graphics boost sets gpu_freq in config.txt "
+                 "(needs a reboot). Anything above stock needs a fan / active cooler and the "
+                 "official 27 W power supply. Not every Pi can reach every level - use the "
+                 "Overclock Finder below to find what YOUR Pi can do. If the Pi won't boot "
+                 "after a change, take out the SD card and remove the pi-security block from "
+                 "config.txt on another computer. A backup is saved as config.txt.bak-security.",
+    "tuner": "The Overclock Finder tests faster and faster CPU and graphics speeds, one "
+             "reboot per step, and finds the fastest your Pi runs with no errors, no "
+             "throttling, no under-voltage and under 82 C. It then picks one step BELOW that "
+             "as your safe setting and checks CPU + graphics together.\n\n"
+             "It's safe to leave running: each test speed is used for ONE boot only "
+             "(Pi 5 'tryboot'), and the watchdog restarts the Pi if a test freezes it - it "
+             "then comes back on normal settings. If the screen ever stays black for more "
+             "than 3 minutes, unplug the Pi and plug it back in; it picks up where it left off.\n\n"
+             "Takes about 45-60 minutes and about 10 reboots. Keep a monitor plugged in for "
+             "the graphics test. The desktop shows up a few minutes late during each step "
+             "while the test runs.",
     "throttle": "If the Pi gets too hot (about 80-85 C) or the power supply is too weak, "
                 "the firmware slows it down. 'Under-voltage' means use a better supply.",
     "gen3": "The Pi 5's PCIe slot runs at Gen 2 (about 450 MB/s) by default. Gen 3 roughly "
@@ -128,8 +141,11 @@ INFO = {
     "readahead": "How much the kernel reads ahead on big sequential reads. "
                  "Bigger = faster large file copies and backups. Changes right away "
                  "and is kept after a reboot.",
-    "trim": "Weekly TRIM tells the SSD which blocks are free, keeping it fast "
-            "over time (systemd fstrim.timer).",
+    "trim": "TRIM tells the SSD which blocks are free, keeping it fast over time "
+            "(systemd fstrim.timer).\n\nWeekly is the Raspberry Pi OS default and is "
+            "right for most people. Daily is good if you write or delete a lot "
+            "(backups, logs, RAID rebuilds, big downloads). Off turns automatic TRIM off.\n\n"
+            "'Run TRIM now' trims every mounted drive straight away.",
     "speedtest": "Reads 1 GB straight from the drive (read-only - it doesn't change "
                  "anything) to measure its real speed.",
     "ntp": "Network time keeps the clock correct automatically from the internet "
@@ -222,25 +238,28 @@ def power_history(hours=24):
 
 # CPU/GPU profiles. governor = live (no reboot); config = lines put in config.txt (reboot)
 PROFILES = {
-    "save": {"name": "Save Energy", "governor": "powersave",
-             "config": ["# Save Energy: CPU held at its lowest speed, GPU slowed down",
-                        "gpu_freq=500"],
+    "save": {"name": "Save Energy", "governor": "powersave", "cpu": 2400, "gpu": 500,
              "desc": "Lowest CPU speed and a slower GPU. Runs cooler and quieter and "
                      "uses the least power - fine for servers, RAID, hotspot and "
                      "background jobs."},
-    "normal": {"name": "Normal", "governor": "ondemand", "config": [],
+    "normal": {"name": "Normal", "governor": "ondemand", "cpu": 2400, "gpu": 910,
                "desc": "Raspberry Pi OS default. The CPU speeds up when there's work "
                        "and slows down when idle. Stock GPU speed."},
-    "perf": {"name": "Performance", "governor": "performance",
-             "config": ["# Performance: CPU always at full speed"],
+    "perf": {"name": "Performance", "governor": "performance", "cpu": None, "gpu": None,
              "desc": "CPU stays at full speed all the time - snappier desktop, faster "
-                     "builds, but more heat and power. Tick 'Overclock' for even more."},
+                     "builds, but more heat and power. Pick a CPU overclock and graphics boost below for more."},
 }
 INFO["profile"] = ("\n\n".join(f"{p['name']}: {p['desc']}" for p in PROFILES.values())
                    + "\n\nThe CPU part changes right away and is kept after a reboot. "
                      "The GPU part goes in config.txt and needs a reboot.")
-OVERCLOCK = ["# Overclock (needs good cooling and the 27 W power supply)",
-             "arm_freq=2800", "gpu_freq=1000"]
+CPU_STOCK, GPU_STOCK = 2400, 910
+CPU_CHOICES = [(2400, "Stock - 2.4 GHz"), (2600, "OC 1 - 2.6 GHz"), (2700, "OC 2 - 2.7 GHz"),
+               (2800, "OC 3 - 2.8 GHz"), (2900, "OC 4 - 2.9 GHz"), (3000, "OC 5 - 3.0 GHz")]
+GPU_CHOICES = [(500, "Eco - 500 MHz (saves power)"), (910, "Stock - 910 MHz"),
+               (1000, "Boost 1 - 1000 MHz"), (1050, "Boost 2 - 1050 MHz"), (1100, "Boost 3 - 1100 MHz")]
+TUNER = "/usr/local/sbin/pi-oc-tuner"
+TUNER_STATE = "/var/lib/pi-security/oc-tuner.json"
+TUNER_LOG = "/var/lib/pi-security/oc-tuner.log"
 
 
 def read_sys(path, default=""):
@@ -288,6 +307,68 @@ def raspi(*args):
     return ["raspi-config", "nonint", *args]
 
 
+def is_root_password(pw):
+    """True if pw is the ROOT password (what `su` asks for). Uses a pseudo-terminal
+    because su only reads passwords from a terminal."""
+    import pty, select
+    try:
+        pid, fd = pty.fork()
+    except OSError:
+        return False
+    if pid == 0:
+        os.environ["LC_ALL"] = "C"
+        os.execvp("su", ["su", "-c", "true", "root"])
+    buf, sent, end = b"", False, time.time() + 8
+    try:
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    data = os.read(fd, 1024)
+                except OSError:
+                    break
+                if not data:
+                    break
+                buf += data
+                if not sent and b"assword" in buf:
+                    os.write(fd, pw.encode() + b"\n")
+                    sent = True
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+        else:
+            os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
+        return sent and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def wrong_password_help(pw):
+    """Explain why sudo said no, in plain words."""
+    if is_root_password(pw):
+        return ("That's your ROOT password (the one 'su' asks for).\n\n"
+                f"This app needs the password for your own account, '{USER}' - the one "
+                "'sudo' asks for. On a Raspberry Pi they can be different.\n\n"
+                f"Forgot the {USER} password? Open a terminal and type:\n"
+                f"   su -c 'passwd {USER}'\n"
+                "enter the root password, then pick a new password for "
+                f"{USER} and use that here.")
+    in_sudo = "sudo" in run(["id", "-nG"])[1].split()
+    msg = f"sudo did not accept that password for '{USER}'.\n\n"
+    if not in_sudo:
+        msg += (f"Also, '{USER}' isn't in the 'sudo' group, so sudo will always say no.\n"
+                "Fix (in a terminal):  su -c 'usermod -aG sudo " + USER + "'  then log out and in.")
+    else:
+        msg += ("Check Caps Lock and the keyboard layout, and use the password for "
+                f"'{USER}' (not the root password).")
+    return msg
+
+
 def session_type():
     if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
         return "wayland"
@@ -313,7 +394,7 @@ class Root:
             self.cached = pw
             return pw
         if pw:
-            messagebox.showerror(APP_NAME, "That password was not accepted by sudo.")
+            messagebox.showerror(APP_NAME, wrong_password_help(pw))
         return None
 
     @staticmethod
@@ -492,7 +573,8 @@ class App(tk.Tk):
         dlg.title("Administrator password")
         dlg.transient(self)
         dlg.grab_set()
-        ttk.Label(dlg, text=f"Password for {USER}:", padding=(14, 12, 14, 4)).pack(anchor="w")
+        ttk.Label(dlg, text=f"Password for {USER} (your login password, not root):",
+                  padding=(14, 12, 14, 4)).pack(anchor="w")
         v = tk.StringVar()
         e = ttk.Entry(dlg, textvariable=v, show="•", width=32)
         e.pack(padx=14)
@@ -840,15 +922,50 @@ fi
             r = ttk.Frame(box); r.pack(fill="x", pady=2)
             ttk.Radiobutton(r, text=p["name"], value=key, variable=self.v_profile, width=14).pack(side="left")
             ttk.Label(r, text=p["desc"], style="Dim.TLabel", wraplength=560, justify="left").pack(side="left")
-        r = ttk.Frame(box); r.pack(fill="x", pady=(6, 0))
-        self.v_oc = tk.BooleanVar(value=self.s.get("overclock", False))
-        ttk.Checkbutton(r, text="Overclock with Performance (CPU 2.8 GHz, GPU 1 GHz)",
-                        variable=self.v_oc).pack(side="left")
+        self.v_profile.trace_add("write", lambda *a: self._profile_defaults())
+        r = ttk.Frame(box); r.pack(fill="x", pady=(8, 0))
+        ttk.Label(r, text="CPU speed:", width=15).pack(side="left")
+        self.v_cpu = tk.StringVar()
+        self.cb_cpu = ttk.Combobox(r, textvariable=self.v_cpu, state="readonly", width=30)
+        self.cb_cpu.pack(side="left")
         self.info_btn(r, "overclock").pack(side="right")
+        r = ttk.Frame(box); r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text="Graphics boost:", width=15).pack(side="left")
+        self.v_gpu = tk.StringVar()
+        self.cb_gpu = ttk.Combobox(r, textvariable=self.v_gpu, state="readonly", width=30)
+        self.cb_gpu.pack(side="left")
+        self._fill_speed_choices()
+        self._set_combo(self.cb_cpu, CPU_CHOICES, self.s.get("cpu_mhz", CPU_STOCK))
+        self._set_combo(self.cb_gpu, GPU_CHOICES, self.s.get("gpu_mhz", GPU_STOCK))
         r = ttk.Frame(box); r.pack(fill="x", pady=(8, 0))
         ttk.Button(r, text="Apply", style="Accent.TButton", command=self.apply_profile).pack(side="left")
         self.pw_note = ttk.Label(r, text="", style="Dim.TLabel")
         self.pw_note.pack(side="left", padx=10)
+
+        tu = ttk.Labelframe(t, text="Overclock Finder - find YOUR Pi's safe CPU & graphics speeds",
+                            style="Card.TLabelframe")
+        tu.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(tu); r.pack(fill="x")
+        ttk.Label(r, text="Test:").pack(side="left")
+        self.v_tune_what = tk.StringVar(value="both")
+        for val, txt in (("both", "CPU + graphics"), ("cpu", "CPU only"), ("gpu", "Graphics only")):
+            ttk.Radiobutton(r, text=txt, value=val, variable=self.v_tune_what).pack(side="left", padx=(8, 0))
+        self.info_btn(r, "tuner").pack(side="right")
+        r = ttk.Frame(tu); r.pack(fill="x", pady=(4, 0))
+        self.v_tune_apply = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text="Use the safe settings automatically when it's done",
+                        variable=self.v_tune_apply).pack(side="left")
+        r = ttk.Frame(tu); r.pack(fill="x", pady=(6, 0))
+        self.btn_tune = ttk.Button(r, text="▶ Start Overclock Finder", style="Accent.TButton",
+                                   command=self.tuner_start)
+        self.btn_tune.pack(side="left")
+        ttk.Button(r, text="Cancel", command=self.tuner_cancel).pack(side="left", padx=6)
+        ttk.Button(r, text="Show log", command=self.tuner_log).pack(side="left")
+        self.btn_use = ttk.Button(r, text="Use safe results", command=self.tuner_use)
+        self.btn_use.pack(side="left", padx=6)
+        self.tune_status = ttk.Label(tu, text="", justify="left", wraplength=700)
+        self.tune_status.pack(anchor="w", pady=(6, 0))
+        self.tuner_refresh()
 
         pw = ttk.Labelframe(t, text="Restart / shut down", style="Card.TLabelframe")
         pw.pack(fill="x", pady=(10, 0))
@@ -1064,35 +1181,151 @@ WantedBy=multi-user.target
             return self.root_cmd.run(["rm", "-f", os.path.join(POWER_STATE, name)])
         return self.root_cmd.write_file(os.path.join(POWER_STATE, name), str(value) + "\n", "0644")
 
+    # ---- speed choices
+    def tuner_state(self):
+        try:
+            with open(TUNER_STATE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _fill_speed_choices(self):
+        st = self.tuner_state()
+        cpu = [lbl for _, lbl in CPU_CHOICES]
+        gpu = [lbl for _, lbl in GPU_CHOICES]
+        if st.get("phase") == "done" and st.get("cpu_safe"):
+            cpu.append(f"Safe (from Finder) - {st['cpu_safe']} MHz")
+        if st.get("phase") == "done" and st.get("gpu_safe"):
+            gpu.append(f"Safe (from Finder) - {st['gpu_safe']} MHz")
+        self.cb_cpu.config(values=cpu)
+        self.cb_gpu.config(values=gpu)
+
+    @staticmethod
+    def _mhz(text):
+        m = re.findall(r"(\d[\d.]*)\s*(GHz|MHz)", text)
+        if not m:
+            return None
+        v, unit = m[-1]
+        return int(round(float(v) * 1000)) if unit == "GHz" else int(v)
+
+    def _set_combo(self, cb, choices, mhz):
+        for v, lbl in choices:
+            if v == mhz:
+                cb.set(lbl)
+                return
+        for lbl in cb.cget("values"):
+            if self._mhz(lbl) == mhz:
+                cb.set(lbl)
+                return
+        cb.set(choices[1][1] if cb is self.cb_gpu else choices[0][1])
+
+    def _profile_defaults(self):
+        p = PROFILES[self.v_profile.get()]
+        if p["cpu"]:
+            self._set_combo(self.cb_cpu, CPU_CHOICES, p["cpu"])
+        if p["gpu"]:
+            self._set_combo(self.cb_gpu, GPU_CHOICES, p["gpu"])
+
     def apply_profile(self):
         key = self.v_profile.get()
         p = PROFILES[key]
-        oc = self.v_oc.get() and key == "perf"
-        if oc and not messagebox.askyesno(APP_NAME, INFO["overclock"] + "\n\nOverclock?"):
-            return
+        cpu = self._mhz(self.v_cpu.get()) or CPU_STOCK
+        gpu = self._mhz(self.v_gpu.get()) or GPU_STOCK
+        if (cpu > CPU_STOCK or gpu > GPU_STOCK) and not self.s.get("oc_warned"):
+            if not messagebox.askyesno(APP_NAME, INFO["overclock"] + "\n\nContinue?"):
+                return
+            self.s["oc_warned"] = True
         if not self.root_cmd.ensure():
             return
         avail = read_sys("/sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors").split()
         gov = p["governor"] if (not avail or p["governor"] in avail) else ("schedutil" if "schedutil" in avail else avail[0])
-        # live change, every CPU cluster
         for pol in sorted(os.listdir("/sys/devices/system/cpu/cpufreq")) if os.path.isdir("/sys/devices/system/cpu/cpufreq") else []:
             if pol.startswith("policy"):
                 self.root_cmd.run(["sh", "-c", f"echo {gov} > /sys/devices/system/cpu/cpufreq/{pol}/scaling_governor"])
         self.set_state("governor", gov)
         self.ensure_power_service()
-        lines = p["config"] + (OVERCLOCK if oc else [])
-        if all(l.startswith("#") for l in lines):
-            lines = []  # nothing but comments - leave config.txt alone
+        lines = []
+        if cpu != CPU_STOCK:
+            lines.append(f"arm_freq={cpu}")
+        if gpu != GPU_STOCK:
+            lines.append(f"gpu_freq={gpu}")
+        if lines:
+            lines.insert(0, f"# {p['name']} - CPU {cpu} MHz, graphics {gpu} MHz")
         changed = self.config_block("power", lines)
-        self.s.update(profile=key, overclock=oc)
+        self.s.update(profile=key, cpu_mhz=cpu, gpu_mhz=gpu)
         save_settings(self.s)
-        msg = f"{p['name']} profile on (CPU governor: {gov})."
+        msg = f"{p['name']} on (CPU governor: {gov}; CPU {cpu} MHz, graphics {gpu} MHz)."
         if changed:
-            msg += " Reboot to apply the GPU / overclock part."
-            self.pw_note.config(text="Reboot needed for the config.txt part")
+            msg += " Reboot to use the new speeds."
+            self.pw_note.config(text="Reboot needed for the new speeds")
+            if messagebox.askyesno(APP_NAME, "New CPU / graphics speeds are saved.\nRestart now to use them?"):
+                self.root_cmd.run(["systemctl", "reboot"])
         else:
             self.pw_note.config(text="")
         self.say(msg)
+
+    # ---- overclock finder
+    def tuner_refresh(self):
+        st = self.tuner_state()
+        ph = st.get("phase")
+        rows = []
+        for r in st.get("results", [])[-12:]:
+            sc = f", score {r['score']}" if r.get("score") else ""
+            rows.append(f"{'✔' if r['ok'] else '✖'} {r['label']:<8} CPU {r['cpu']} / GPU {r['gpu']} MHz"
+                        f" - {r.get('why', '')}{sc}")
+        if not st:
+            txt = "Not run yet. Press Start to find your Pi's safe overclock (about 45-60 min)."
+        elif ph == "done":
+            txt = "✔ Done: " + (st.get("note") or "") + ("\n" + "\n".join(rows) if rows else "")
+        elif ph == "cancelled":
+            txt = "Cancelled."
+        else:
+            p = st.get("pending") or {}
+            txt = (f"⏳ Running - step {st.get('boots', 0)} ({ph}). Next/now: CPU {p.get('cpu', '?')} / "
+                   f"GPU {p.get('gpu', '?')} MHz. The Pi will reboot by itself - leave it on.\n" + "\n".join(rows))
+        self.tune_status.config(text=txt)
+        running = ph not in (None, "done", "cancelled")
+        self.btn_tune.state(["disabled"] if running else ["!disabled"])
+        self.btn_use.state(["!disabled"] if ph == "done" and st.get("cpu_safe") else ["disabled"])
+        self._fill_speed_choices()
+        self.after(15000, self.tuner_refresh)
+
+    def tuner_start(self):
+        if not os.path.exists(TUNER):
+            messagebox.showerror(APP_NAME, "The Overclock Finder isn't installed yet - press ⟳ Update app.")
+            return
+        what = self.v_tune_what.get()
+        if not messagebox.askyesno(APP_NAME, INFO["tuner"] + "\n\nSave your work - the Pi will reboot "
+                                   "about 10 times.\n\nStart now?"):
+            return
+        if not self.root_cmd.ensure():
+            return
+        args = [TUNER, "start"] + (["--cpu-only"] if what == "cpu" else ["--gpu-only"] if what == "gpu" else [])
+        if self.v_tune_apply.get():
+            args.append("--apply")
+        self.bg(lambda: self.root_cmd.run(args, timeout=1800),
+                "Overclock Finder started - the Pi will reboot now.",
+                "Installing test tools and checking cooling (about 2 minutes)…",
+                after=self.tuner_refresh)
+
+    def tuner_cancel(self):
+        if not os.path.exists(TUNER):
+            return
+        if messagebox.askyesno(APP_NAME, "Stop the Overclock Finder?"):
+            rc, out = self.root_cmd.run([TUNER, "cancel"])
+            self._done(rc, out, "Overclock Finder cancelled.")
+            self.tuner_refresh()
+
+    def tuner_log(self):
+        self.text_window("Overclock Finder log", read_sys(TUNER_LOG, "(no log yet)"))
+
+    def tuner_use(self):
+        st = self.tuner_state()
+        if st.get("cpu_safe"):
+            self._set_combo(self.cb_cpu, CPU_CHOICES, st["cpu_safe"])
+        if st.get("gpu_safe"):
+            self._set_combo(self.cb_gpu, GPU_CHOICES, st["gpu_safe"])
+        self.say("Safe speeds from the Finder are selected - press Apply.")
 
     # ================================================================ TURBO DISK
     def build_disk(self):
@@ -1116,14 +1349,19 @@ WantedBy=multi-user.target
         self.v_aspm = tk.BooleanVar(value=self.cmd_has("pcie_aspm"))
         ra = read_sys(POWER_STATE + "/nvme-readahead")
         self.v_ra = tk.StringVar(value=ra or "128")
-        self.v_trim = tk.BooleanVar(value=run(["systemctl", "is-enabled", "fstrim.timer"])[1] == "enabled")
+        self.v_trim = tk.StringVar(value=self.trim_mode())
         for var, text, key in ((self.v_gen3, "PCIe Gen 3 (about 2x faster)", "gen3"),
                                (self.v_apst, "Keep the drive awake (no deep power saving)", "apst"),
-                               (self.v_aspm, "PCIe link power saving OFF", "aspm"),
-                               (self.v_trim, "Weekly TRIM (keeps the SSD fast)", "trim")):
+                               (self.v_aspm, "PCIe link power saving OFF", "aspm")):
             r = ttk.Frame(tb); r.pack(fill="x", pady=1)
             ttk.Checkbutton(r, text=text, variable=var).pack(side="left")
             self.info_btn(r, key).pack(side="right")
+        r = ttk.Frame(tb); r.pack(fill="x", pady=1)
+        ttk.Label(r, text="TRIM (keeps the SSD fast):").pack(side="left")
+        for val, txt in (("daily", "Daily"), ("weekly", "Weekly"), ("off", "Off")):
+            ttk.Radiobutton(r, text=txt, value=val, variable=self.v_trim).pack(side="left", padx=(8, 0))
+        ttk.Button(r, text="Run TRIM now", command=self.trim_now).pack(side="left", padx=(14, 0))
+        self.info_btn(r, "trim").pack(side="right")
         r = ttk.Frame(tb); r.pack(fill="x", pady=1)
         ttk.Label(r, text="Read-ahead (KB):").pack(side="left")
         ttk.Combobox(r, textvariable=self.v_ra, values=["128", "512", "1024", "2048", "4096"],
@@ -1142,6 +1380,35 @@ WantedBy=multi-user.target
         self.speed_lbl.pack(side="left", padx=10)
         self.info_btn(r, "speedtest").pack(side="right")
         self.refresh_disk()
+
+    TRIM_DROPIN = "/etc/systemd/system/fstrim.timer.d/pi-security.conf"
+
+    def trim_mode(self):
+        if run(["systemctl", "is-enabled", "fstrim.timer"])[1] != "enabled":
+            return "off"
+        return "daily" if "OnCalendar=daily" in read_sys(self.TRIM_DROPIN) else "weekly"
+
+    def set_trim(self, mode):
+        if mode == "daily":
+            self.root_cmd.run(["mkdir", "-p", os.path.dirname(self.TRIM_DROPIN)])
+            self.root_cmd.write_file(self.TRIM_DROPIN,
+                                     "# Managed by Pi-Performance / Security - TRIM every day\n"
+                                     "[Timer]\nOnCalendar=\nOnCalendar=daily\n"
+                                     "RandomizedDelaySec=30min\nPersistent=true\n", "0644")
+        else:
+            self.root_cmd.run(["rm", "-f", self.TRIM_DROPIN])
+        self.root_cmd.run(["systemctl", "daemon-reload"])
+        if mode == "off":
+            self.root_cmd.run(["systemctl", "disable", "--now", "fstrim.timer"])
+        else:
+            self.root_cmd.run(["systemctl", "enable", "fstrim.timer"])
+            self.root_cmd.run(["systemctl", "restart", "fstrim.timer"])
+
+    def trim_now(self):
+        if not self.root_cmd.ensure():
+            return
+        self.bg(lambda: self.root_cmd.run(["fstrim", "-av"], timeout=900),
+                "TRIM finished", "Running TRIM on all drives…", show_output=True)
 
     def cmd_has(self, key):
         return any(x.split("=")[0] == key for x in read_sys(CMDLINE_TXT).split())
@@ -1170,7 +1437,8 @@ WantedBy=multi-user.target
         self.disk_info.config(text="\n".join(lines))
 
     def turbo(self, on):
-        self.v_gen3.set(on); self.v_apst.set(on); self.v_aspm.set(on); self.v_trim.set(True)
+        self.v_gen3.set(on); self.v_apst.set(on); self.v_aspm.set(on)
+        self.v_trim.set("daily" if on else "weekly")
         self.v_ra.set("2048" if on else "128")
         self.apply_disk()
 
@@ -1195,7 +1463,7 @@ WantedBy=multi-user.target
                 self.root_cmd.run(["sh", "-c", f"echo {ra} > /sys/block/{d}/queue/read_ahead_kb"])
         self.set_state("nvme-readahead", ra if ra != 128 else None)
         self.ensure_power_service()
-        self.root_cmd.run(["systemctl", "enable" if self.v_trim.get() else "disable", "--now", "fstrim.timer"])
+        self.set_trim(self.v_trim.get())
         self.refresh_disk()
         if reboot:
             self.disk_note.config(text="Reboot to finish (boot files changed)")
@@ -1443,6 +1711,8 @@ WantedBy=multi-user.target
         self.v_user = tk.StringVar(value=USER)
         ttk.Entry(g, textvariable=self.v_user, width=24, state="readonly").grid(row=0, column=1, sticky="w", padx=8)
         ttk.Label(g, text="Password").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(g, text=f"your {USER} login password (not root)", style="Dim.TLabel").grid(
+            row=1, column=2, sticky="w")
         self.v_pw = tk.StringVar()
         ttk.Entry(g, textvariable=self.v_pw, show="•", width=24).grid(row=1, column=1, sticky="w", padx=8)
         self.info_btn(g, "keyring").grid(row=0, column=3, sticky="e")
@@ -1511,7 +1781,7 @@ WantedBy=multi-user.target
                                            "'Install lock tools' (it also installs the keyring).")
             return
         if not Root._check(pw):
-            messagebox.showerror(APP_NAME, "That password is wrong - sudo rejected it.")
+            messagebox.showerror(APP_NAME, wrong_password_help(pw))
             return
         rc, out = run(["secret-tool", "store", f"--label=Pi Security login ({USER})", *KEYRING_ATTRS],
                       inp=pw)

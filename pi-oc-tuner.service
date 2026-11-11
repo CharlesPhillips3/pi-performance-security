@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi-Performance / Security - overclock finder (only does something while tuning)
+After=local-fs.target systemd-udevd.service
+Before=display-manager.service getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pi-oc-tuner boot
+TimeoutStartSec=0
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

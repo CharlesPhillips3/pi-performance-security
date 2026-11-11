@@ -15,11 +15,17 @@ A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with seven tabs:
 ## Power
 - **Live readout**: CPU and GPU speed, governor, temperature, power draw in watts, and under-voltage / throttling warnings.
 - **24-hour power graph** with average, min and peak watts, **kWh per day**, and estimated **cost per month and year** at your electric rate. The `pi-powerlog` service records the Pi 5's power chip once a minute, so the graph keeps filling while the app is closed. (It measures the Pi board and what it powers - a good estimate, not a wall-plug meter.)
-- **CPU & graphics profiles**:
-  - **Save Energy**: CPU at its lowest speed (`powersave`), GPU slowed to 500 MHz.
-  - **Normal**: Raspberry Pi OS default (`ondemand`), stock GPU.
-  - **Performance**: CPU always at full speed (`performance`). Optional **Overclock** to CPU 2.8 GHz and GPU 1 GHz (needs a cooler and the 27 W supply).
-  - The CPU part applies instantly and is kept across reboots. The GPU/overclock part goes in a marked block in `config.txt` (backup saved) and needs a reboot.
+- **CPU & graphics profiles**: **Save Energy** (`powersave`, graphics Eco 500 MHz), **Normal** (`ondemand`, stock), **Performance** (`performance`, CPU always at full speed).
+- **CPU speed**: Stock 2.4 GHz, or OC 1-5 (2.6 / 2.7 / 2.8 / 2.9 / 3.0 GHz).
+- **Graphics boost**: Eco 500 MHz, Stock 910 MHz, Boost 1 (1000), Boost 2 (1050), Boost 3 (1100).
+- The governor changes instantly; the speeds go in a marked block in `config.txt` (backup saved) and need a reboot.
+- **Overclock Finder**: finds the fastest CPU and graphics speeds **your** Pi runs safely, by itself:
+  - Steps up one level per reboot and stress-tests each one: `stress-ng --verify` for the CPU (catches wrong answers, not just crashes) and `glmark2` for graphics.
+  - A level passes only with no errors, no crash, no throttling, no under-voltage, and under 82 °C.
+  - **Safe result = one step below the fastest that passed**, then CPU and graphics are checked together.
+  - **Can't brick your setup**: each test speed is used for one boot only (Pi 5 *tryboot*) and the hardware watchdog restarts a frozen Pi back onto normal settings.
+  - About 45-60 minutes and roughly 10 reboots. Keep a monitor plugged in for the graphics test. It can apply the safe result automatically, or you pick it from the dropdowns ("Safe (from Finder)").
+  - Command line: `sudo pi-oc-tuner start | status | cancel`
 - **Restart** and **Shut down** buttons.
 
 ## Turbo Disk
@@ -29,7 +35,8 @@ A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with seven tabs:
   - **Keeps the drive awake**: no deep power-saving states, so no wake-up lag
   - **PCIe link power saving off** (ASPM)
   - **Bigger read-ahead** (2 MB) for fast big-file copies and backups
-  - **Weekly TRIM**
+  - **Daily TRIM**
+- **TRIM schedule**: Daily, Weekly (default) or Off, plus a **Run TRIM now** button.
 - **Turbo OFF** puts everything back to stock. You can also set each option on its own.
 - **Speed test**: reads 1 GB straight from the drive (read-only) and shows the MB/s.
 
@@ -103,6 +110,7 @@ This removes the app, its autostart entry, the saved keyring password, and its s
 | `security.py` | The app (Python 3 + Tkinter) |
 | `pi-sudo` | Runs sudo with the password saved in the keyring |
 | `pi-powerlog`, `pi-powerlog.service` | Background power-draw logger for the 24-hour graph |
+| `pi-oc-tuner`, `pi-oc-tuner.service` | Overclock Finder (only active while tuning) |
 | `install.sh` / `uninstall.sh` | Installer / remover |
 | `security.desktop`, `security.png` | Menu entry and icon |
 
