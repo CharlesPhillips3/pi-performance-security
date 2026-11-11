@@ -43,14 +43,14 @@ Every setting has an **i** button that explains what it does.
 ```bash
 git clone https://github.com/CharlesPhillips3/security.git
 cd security
-./install.sh
+bash install.sh
 ```
 Open it from **Menu → Preferences → Security**, or run `pi-security`.
 Log out and back in once after installing so the keyring unlocks at login.
 
 ## Uninstall
 ```bash
-./uninstall.sh
+bash uninstall.sh
 ```
 This removes the app, its autostart entry, the saved keyring password, and its sudoers/polkit rules.
 
