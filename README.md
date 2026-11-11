@@ -1,10 +1,14 @@
 # Security for Raspberry Pi 5
 
-A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with three tabs:
+A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with five tabs:
 
-| Auto-Lock | Login Once | Clock |
+| Auto-Lock | Sleep & Power | Access |
 |---|---|---|
-| ![](screenshot-autolock.png) | ![](screenshot-login.png) | ![](screenshot-clock.png) |
+| ![](screenshot-autolock.png) | ![](screenshot-power.png) | ![](screenshot-access.png) |
+
+| Login Once | Clock |
+|---|---|
+| ![](screenshot-login.png) | ![](screenshot-clock.png) |
 
 ## Auto-Lock
 - Lock the screen after an idle time you set in **hours and minutes**, turn the monitor off a set time (hours + minutes) after it locks, and lock before the Pi sleeps.
@@ -12,6 +16,19 @@ A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with three tabs:
 - Wayland desktop (labwc / wayfire): uses `swayidle` + `swaylock` (+ `wlopm` for monitor off).
   X11 desktop: uses `light-locker` with the X screensaver timer.
 - Starts at every login. Adds a marked block to `~/.config/labwc/autostart` (the rest of the file is left alone).
+
+## Sleep & Power
+- **Sleep ENABLED / DISABLED** for the whole Pi (masks the systemd sleep targets). When it's disabled, nothing can put the Pi to sleep, which is the safe setting for an always-on Pi (servers, RAID, hotspot). The status line shows which sleep modes your Pi supports.
+- **Put the Pi to sleep when idle** after a set time in hours + minutes (Wayland desktop; only while sleep is enabled).
+- Raspberry Pi OS **screen blanking** on/off. Turn it off if you use the monitor-off timer on the Auto-Lock tab.
+- **Restart** and **Shut down** buttons (with a confirm step).
+
+## Access
+- **Desktop auto-login** on/off. With auto-login on, anyone who reboots the Pi gets in with no password, so the auto-lock doesn't protect you.
+- **SSH** and **VNC** on/off, with live status.
+- **Firewall (ufw)** on/off. "ON" keeps SSH (22) and VNC (5900) open so you can't lock yourself out, and blocks everything else coming in.
+- **Login history**: failed and successful logins (SSH, sudo, desktop) from the last 7 days.
+- **Updates**: check for and install system updates.
 
 ## Login Once
 - **Save to keyring**: checks your password with sudo, then stores it **encrypted** in the login keyring (gnome-keyring). The keyring unlocks when you log in, so your password is entered once per login.
@@ -52,7 +69,7 @@ Log out and back in once after installing so the keyring unlocks at login.
 ```bash
 bash uninstall.sh
 ```
-This removes the app, its autostart entry, the saved keyring password, and its sudoers/polkit rules.
+This removes the app, its autostart entry, the saved keyring password, and its sudoers/polkit rules, and re-enables sleep. Auto-login, SSH, VNC, firewall and RTC settings stay as you left them.
 
 ## Files
 | File | What it is |

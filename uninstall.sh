@@ -9,5 +9,6 @@ sudo rm -f /etc/sudoers.d/60-pi-security /etc/polkit-1/rules.d/49-pi-security.ru
   /usr/local/bin/pi-security /usr/local/bin/pi-sudo /usr/share/applications/pi-security.desktop \
   /usr/share/icons/hicolor/128x128/apps/pi-security.png
 sudo rm -rf /opt/pi-security
+sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
 rm -rf ~/.config/pi-security
-echo "Security app removed. (RTC charging line in config.txt, if you added it, was left alone.)"
+echo "Security app removed. (Sleep is re-enabled. RTC charging, auto-login, SSH, VNC and firewall settings are left as they are.)"

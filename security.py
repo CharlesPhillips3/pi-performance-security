@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "Security"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 USER = getpass.getuser()
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(HOME, ".config", "pi-security")
@@ -76,6 +76,32 @@ INFO = {
                 "Keep auto-lock on if you use this.",
     "polkit": "Skips the graphical 'Authentication required' pop-up (pkexec / "
               "polkit) for your user. Same trade-off as full sudo.",
+    "sysleep": "Turns system sleep (suspend) on or off for the whole Pi by masking "
+               "the systemd sleep targets. When it's off, nothing - not the menu, "
+               "not an app, not the idle timer - can put the Pi to sleep. "
+               "Note: the Pi 5 has only limited suspend support, so 'off' is the "
+               "safe setting for an always-on Pi (servers, RAID, hotspot).",
+    "idlesleep": "Puts the Pi to sleep after this much idle time. Works on the "
+                 "default Wayland desktop. Only runs while system sleep is enabled.",
+    "blank": "Raspberry Pi OS's own screen blanking (Raspberry Pi Configuration > "
+             "Display). Turn it OFF if you use the monitor-off timer on the "
+             "Auto-Lock tab, so the two don't fight. Needs a reboot or re-login.",
+    "power": "Restart or shut down the Pi. You'll be asked to confirm first.",
+    "autologin": "With auto-login ON the Pi goes straight to the desktop at boot, "
+                 "with no password. That means anyone who reboots it gets in, "
+                 "and the auto-lock doesn't help. Turn it OFF so a password is "
+                 "needed after every boot.",
+    "ssh": "SSH lets you log in to the Pi remotely from a terminal. Turn it off "
+           "if you never use it - fewer open doors.",
+    "vnc": "VNC (wayvnc / RealVNC) lets you see and control the desktop "
+           "remotely. Turn it off if you don't use remote desktop.",
+    "ufw": "A firewall (ufw) blocks incoming connections you didn't ask for. "
+           "'Firewall ON' keeps SSH (22) and VNC (5900) open so you can't lock "
+           "yourself out, and blocks everything else coming in.",
+    "fails": "Shows failed and successful logins (SSH, sudo, desktop) from the "
+             "last 7 days, so you can spot someone trying to get in.",
+    "updates": "Checks for and installs software updates (apt full-upgrade). "
+               "Keeping the Pi updated is the best single security step.",
     "ntp": "Network time keeps the clock correct automatically from the internet "
            "(systemd-timesyncd). Turn it off only if you want to set the time by hand.",
     "rtc": "The Pi 5 has a built-in real-time clock. With a battery on the J5 'BAT' "
@@ -107,7 +133,7 @@ def have(prog):
 
 def load_settings():
     d = {"autolock": False, "lock_min": 5, "screenoff": True, "off_min": 2,
-         "lock_sleep": True, "presets": [], "custom": "", "fullsudo": False,
+         "lock_sleep": True, "idle_sleep": False, "sleep_min": 60, "presets": [], "custom": "", "fullsudo": False,
          "polkit": False}
     try:
         with open(CONF_FILE) as f:
@@ -128,6 +154,28 @@ def keyring_get():
         return None
     rc, out = run(["secret-tool", "lookup", *KEYRING_ATTRS])
     return out if rc == 0 and out else None
+
+
+SLEEP_TARGETS = ["sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target"]
+
+
+def sleep_allowed():
+    """False if the Security app (or anyone) masked the systemd sleep targets."""
+    rc, out = run(["systemctl", "is-enabled", "suspend.target"])
+    return "masked" not in out
+
+
+def sleep_supported():
+    try:
+        st = open("/sys/power/state").read().split()
+    except Exception:
+        st = []
+    return st
+
+
+def raspi(*args):
+    """raspi-config non-interactive helper (needs root)."""
+    return ["raspi-config", "nonint", *args]
 
 
 def session_type():
@@ -163,15 +211,22 @@ class Root:
         rc, _ = run(["sudo", "-S", "-k", "-p", "", "-v"], inp=pw + "\n")
         return rc == 0
 
-    def run(self, cmd, inp=None):
-        rc, out = run(["sudo", "-n", *cmd], inp=inp)
+    def ensure(self):
+        """Make sure root commands will work (asks for the password now if needed).
+        Call this on the main thread before starting a background job."""
+        if run(["sudo", "-n", "true"])[0] == 0:
+            return True
+        return self._password() is not None
+
+    def run(self, cmd, inp=None, timeout=60):
+        rc, out = run(["sudo", "-n", *cmd], inp=inp, timeout=timeout)
         if rc == 0 or "password" not in out.lower():
             return rc, out
         pw = self._password()
         if not pw:
             return 1, "Cancelled - administrator password needed."
         data = pw + "\n" + (inp or "")
-        return run(["sudo", "-S", "-p", "", *cmd], inp=data)
+        return run(["sudo", "-S", "-p", "", *cmd], inp=data, timeout=timeout)
 
     def write_file(self, path, text, mode="0440"):
         with tempfile.NamedTemporaryFile("w", delete=False) as t:
@@ -188,7 +243,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME}")
-        self.geometry("680x800")
+        self.geometry("720x800")
         self.minsize(560, 420)
         self.s = load_settings()
         self.root_cmd = Root(self)
@@ -203,17 +258,19 @@ class App(tk.Tk):
         self.nb = nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=12, pady=(4, 0))
         pages = []
-        for name in ("  Auto-Lock  ", "  Login Once  ", "  Clock  "):
+        for name in ("  Auto-Lock  ", "  Sleep & Power  ", "  Access  ", "  Login Once  ", "  Clock  "):
             outer, inner = self._scroller(nb)
             nb.add(outer, text=name)
             pages.append(inner)
-        self.tab_lock, self.tab_login, self.tab_clock = pages
+        self.tab_lock, self.tab_power, self.tab_access, self.tab_login, self.tab_clock = pages
 
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status, style="Status.TLabel",
                   anchor="w", padding=(14, 6)).pack(fill="x", side="bottom")
 
         self.build_lock()
+        self.build_power()
+        self.build_access()
         self.build_login()
         self.build_clock()
         self.tick()
@@ -385,8 +442,30 @@ class App(tk.Tk):
         self.refresh_lock_status()
 
     def write_idle_script(self):
-        lock_s = self._total_min(self.v_lhr, self.v_lmin) * 60
-        off_s = lock_s + self._total_min(self.v_ohr, self.v_omin) * 60
+        """One idle watcher for auto-lock, monitor-off and sleep-after-idle."""
+        c = self.s
+        lock = c["autolock"]
+        lock_s = int(c["lock_min"]) * 60
+        off_s = lock_s + int(c["off_min"]) * 60
+        sleep_on = c["idle_sleep"] and sleep_allowed()
+        sleep_s = int(c["sleep_min"]) * 60
+        way = []
+        if lock:
+            way.append(f"timeout {lock_s} 'swaylock -f -c 1d2430'")
+            if c["screenoff"]:
+                way.append(f"timeout {off_s} 'wlopm --off \\*' resume 'wlopm --on \\*'")
+        if sleep_on:
+            way.append(f"timeout {sleep_s} 'systemctl suspend'")
+        if lock and c["lock_sleep"]:
+            way.append("before-sleep 'swaylock -f -c 1d2430'")
+        way_cmd = "exec swayidle -w " + " ".join(way) + " >/dev/null 2>&1" if way else "exit 0"
+        if lock:
+            dpms = (f"xset +dpms dpms {off_s} {off_s} {off_s}" if c["screenoff"] else "xset -dpms")
+            susp = "--lock-on-suspend" if c["lock_sleep"] else "--no-lock-on-suspend"
+            x_cmd = (f"xset s {lock_s} 0\n  {dpms}\n"
+                     f"  exec light-locker --lock-after-screensaver=0 {susp} >/dev/null 2>&1")
+        else:
+            x_cmd = "xset s off\n  exit 0"
         sh = f"""#!/bin/sh
 # Generated by the Security app - re-written every time you press Apply.
 pkill -u "$USER" -x swayidle 2>/dev/null
@@ -394,25 +473,38 @@ pkill -u "$USER" -x xautolock 2>/dev/null
 pkill -u "$USER" -x light-locker 2>/dev/null
 [ -f "$HOME/.config/pi-security/disabled" ] && exit 0
 if [ -n "$WAYLAND_DISPLAY" ]; then
-  exec swayidle -w \\
-    timeout {lock_s} 'swaylock -f -c 1d2430' \\
-"""
-        if self.v_off.get():
-            sh += f"    timeout {off_s} 'wlopm --off \\*' resume 'wlopm --on \\*' \\\n"
-        if self.v_sleep.get():
-            sh += "    before-sleep 'swaylock -f -c 1d2430' \\\n"
-        sh += f"""    >/dev/null 2>&1
+  {way_cmd}
 else
   # X screensaver timer drives light-locker (works for any number of hours)
-  xset s {lock_s} 0
-  {"xset +dpms dpms " + str(off_s) + " " + str(off_s) + " " + str(off_s) if self.v_off.get() else "xset -dpms"}
-  exec light-locker --lock-after-screensaver=0 {"--lock-on-suspend" if self.v_sleep.get() else "--no-lock-on-suspend"} >/dev/null 2>&1
+  {x_cmd}
 fi
 """
         os.makedirs(os.path.dirname(IDLE_SCRIPT), exist_ok=True)
         with open(IDLE_SCRIPT, "w") as f:
             f.write(sh)
         os.chmod(IDLE_SCRIPT, 0o755)
+
+    def restart_idle(self):
+        """Rewrite the idle watcher and (re)start it, or stop it if nothing needs it."""
+        flag = os.path.join(CONF_DIR, "disabled")
+        os.makedirs(CONF_DIR, exist_ok=True)
+        self.write_idle_script()
+        needed = self.s["autolock"] or (self.s["idle_sleep"] and sleep_allowed())
+        if needed:
+            if os.path.exists(flag):
+                os.remove(flag)
+            self.hook_autostart(True)
+            subprocess.Popen([IDLE_SCRIPT], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            open(flag, "w").close()
+            self.hook_autostart(False)
+            for p in ("swayidle", "xautolock", "light-locker"):
+                run(["pkill", "-u", USER, "-x", p])
+            if session_type() == "x11":
+                run(["xset", "s", "off"])
+        self.after(800, self.refresh_lock_status)
+        return needed
 
     @staticmethod
     def _strip_block(text):
@@ -463,25 +555,11 @@ fi
             messagebox.showerror(APP_NAME, "Hours and minutes must be whole numbers.")
             return
         save_settings(self.s)
-        flag = os.path.join(CONF_DIR, "disabled")
-        self.write_idle_script()
+        self.restart_idle()
         if self.s["autolock"]:
-            if os.path.exists(flag):
-                os.remove(flag)
-            self.hook_autostart(True)
-            subprocess.Popen([IDLE_SCRIPT], start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.say(f"Auto-lock on: locks after {self._fmt(self.s['lock_min'])} idle. Starts at every login.")
         else:
-            open(flag, "w").close()
-            self.hook_autostart(False)
-            run(["pkill", "-u", USER, "-x", "swayidle"])
-            run(["pkill", "-u", USER, "-x", "xautolock"])
-            run(["pkill", "-u", USER, "-x", "light-locker"])
-            if session_type() == "x11":
-                run(["xset", "s", "off"])
             self.say("Auto-lock off.")
-        self.after(800, self.refresh_lock_status)
 
     def lock_now(self):
         if session_type() == "wayland" and have("swaylock"):
@@ -492,6 +570,292 @@ fi
             run(["loginctl", "lock-session"])
         else:
             messagebox.showwarning(APP_NAME, "No lock tool found. Press 'Install lock tools'.")
+
+    # ================================================================ SLEEP & POWER
+    def build_power(self):
+        t = self.tab_power
+        box = ttk.Labelframe(t, text="System sleep", style="Card.TLabelframe")
+        box.pack(fill="x")
+        r = ttk.Frame(box); r.pack(fill="x")
+        ttk.Button(r, text="Sleep ENABLED", command=lambda: self.set_sleep(True)).pack(side="left")
+        ttk.Button(r, text="Sleep DISABLED", command=lambda: self.set_sleep(False)).pack(side="left", padx=6)
+        self.info_btn(r, "sysleep").pack(side="right")
+        self.sleep_status = ttk.Label(box, text="")
+        self.sleep_status.pack(anchor="w", pady=(6, 0))
+
+        r = ttk.Frame(box); r.pack(fill="x", pady=(10, 2))
+        self.v_isleep = tk.BooleanVar(value=self.s["idle_sleep"])
+        ttk.Checkbutton(r, text="Put the Pi to sleep when idle", variable=self.v_isleep).pack(side="left")
+        self.info_btn(r, "idlesleep").pack(side="right")
+        sm = int(self.s["sleep_min"])
+        self.v_shr = tk.IntVar(value=sm // 60)
+        self.v_smin = tk.IntVar(value=sm % 60)
+        self._hm_row(box, "Idle time:", self.v_shr, self.v_smin, 24)
+        ttk.Button(box, text="Apply", style="Accent.TButton", command=self.apply_idle_sleep).pack(anchor="w")
+
+        bl = ttk.Labelframe(t, text="Screen blanking (Raspberry Pi OS setting)", style="Card.TLabelframe")
+        bl.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(bl); r.pack(fill="x")
+        ttk.Button(r, text="Blanking ON", command=lambda: self.raspi_toggle("do_blanking", True, "Screen blanking")).pack(side="left")
+        ttk.Button(r, text="Blanking OFF", command=lambda: self.raspi_toggle("do_blanking", False, "Screen blanking")).pack(side="left", padx=6)
+        self.info_btn(r, "blank").pack(side="right")
+
+        pw = ttk.Labelframe(t, text="Power", style="Card.TLabelframe")
+        pw.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(pw); r.pack(fill="x")
+        ttk.Button(r, text="Restart", command=lambda: self.power("reboot")).pack(side="left")
+        ttk.Button(r, text="Shut down", command=lambda: self.power("poweroff")).pack(side="left", padx=6)
+        self.info_btn(r, "power").pack(side="right")
+        self.refresh_power()
+
+    def refresh_power(self):
+        allowed = sleep_allowed()
+        states = sleep_supported()
+        sup = ("sleep modes on this Pi: " + ", ".join(states)) if states else "this Pi reports no sleep modes"
+        self.sleep_status.config(
+            text=f"{'Sleep is ENABLED' if allowed else 'Sleep is DISABLED'}   ·   {sup}",
+            style="TLabel" if allowed else "Ok.TLabel")
+
+    def set_sleep(self, on):
+        verb = "unmask" if on else "mask"
+        rc, out = self.root_cmd.run(["systemctl", verb, *SLEEP_TARGETS])
+        self._done(rc, out, "System sleep enabled." if on else "System sleep disabled - nothing can put the Pi to sleep.")
+        self.restart_idle()
+        self.refresh_power()
+
+    def apply_idle_sleep(self):
+        try:
+            self.s.update(idle_sleep=self.v_isleep.get(),
+                          sleep_min=self._total_min(self.v_shr, self.v_smin))
+        except (tk.TclError, ValueError):
+            messagebox.showerror(APP_NAME, "Hours and minutes must be whole numbers.")
+            return
+        save_settings(self.s)
+        if self.s["idle_sleep"] and not sleep_allowed():
+            messagebox.showwarning(APP_NAME, "System sleep is disabled, so this won't do anything "
+                                             "until you press 'Sleep ENABLED'.")
+        self.restart_idle()
+        self.say(f"Sleep when idle: {'on, after ' + self._fmt(self.s['sleep_min']) if self.s['idle_sleep'] else 'off'}.")
+
+    def raspi_toggle(self, fn, on, name):
+        if not have("raspi-config"):
+            messagebox.showerror(APP_NAME, "raspi-config not found (it comes with Raspberry Pi OS).")
+            return
+        # raspi-config: 0 = enable, 1 = disable
+        rc, out = self.root_cmd.run(raspi(fn, "0" if on else "1"))
+        self._done(rc, out, f"{name} {'on' if on else 'off'}.")
+        if hasattr(self, "access_rows"):
+            self.after(500, self.refresh_access)
+
+    def power(self, what):
+        word = "restart" if what == "reboot" else "shut down"
+        if messagebox.askyesno(APP_NAME, f"{word.capitalize()} the Pi now?\nSave your work first."):
+            rc, out = self.root_cmd.run(["systemctl", what])
+            if rc != 0:
+                messagebox.showerror(APP_NAME, out)
+
+    # ================================================================ ACCESS
+    def build_access(self):
+        t = self.tab_access
+        box = ttk.Labelframe(t, text="Who can get in", style="Card.TLabelframe")
+        box.pack(fill="x")
+        self.access_rows = {}
+        rows = [
+            ("autologin", "Desktop auto-login (no password at boot)", self.set_autologin),
+            ("ssh", "SSH remote login", lambda on: self.raspi_toggle("do_ssh", on, "SSH")),
+            ("vnc", "VNC remote desktop", lambda on: self.raspi_toggle("do_vnc", on, "VNC")),
+            ("ufw", "Firewall (ufw)", self.set_firewall),
+        ]
+        for key, label, fn in rows:
+            r = ttk.Frame(box); r.pack(fill="x", pady=3)
+            ttk.Label(r, text=label, width=38).pack(side="left")
+            st = ttk.Label(r, text="…", width=12)
+            st.pack(side="left")
+            ttk.Button(r, text="ON", width=5, command=lambda f=fn: f(True)).pack(side="left", padx=(4, 2))
+            ttk.Button(r, text="OFF", width=5, command=lambda f=fn: f(False)).pack(side="left")
+            self.info_btn(r, key).pack(side="right")
+            self.access_rows[key] = st
+        ttk.Button(box, text="Refresh", command=self.refresh_access).pack(anchor="w", pady=(6, 0))
+
+        lg = ttk.Labelframe(t, text="Login history", style="Card.TLabelframe")
+        lg.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(lg); r.pack(fill="x")
+        ttk.Button(r, text="Show failed logins (7 days)", command=lambda: self.show_logins(True)).pack(side="left")
+        ttk.Button(r, text="Show successful logins", command=lambda: self.show_logins(False)).pack(side="left", padx=6)
+        self.info_btn(r, "fails").pack(side="right")
+
+        up = ttk.Labelframe(t, text="Updates", style="Card.TLabelframe")
+        up.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(up); r.pack(fill="x")
+        ttk.Button(r, text="Check for updates", command=self.check_updates).pack(side="left")
+        ttk.Button(r, text="Install updates", command=self.install_updates).pack(side="left", padx=6)
+        self.info_btn(r, "updates").pack(side="right")
+        self.upd_status = ttk.Label(up, text="", style="Dim.TLabel")
+        self.upd_status.pack(anchor="w", pady=(6, 0))
+        self.refresh_access()
+
+    def _set_row(self, key, on, good_when_on):
+        lbl = self.access_rows[key]
+        if on is None:
+            lbl.config(text="unknown", style="Dim.TLabel")
+        else:
+            good = on == good_when_on
+            lbl.config(text=("● ON" if on else "○ OFF"), style="Ok.TLabel" if good else "Bad.TLabel")
+
+    def refresh_access(self):
+        self._set_row("autologin", self.autologin_on(), False)
+        self._set_row("ssh", run(["systemctl", "is-active", "ssh"])[1] == "active", True)
+        vnc = any(run(["systemctl", "is-active", u])[1] == "active"
+                  for u in ("wayvnc", "wayvnc-control", "vncserver-x11-serviced"))
+        self._set_row("vnc", vnc, True)
+        if have("ufw") or os.path.exists("/usr/sbin/ufw"):
+            rc, out = run(["sudo", "-n", "ufw", "status"])
+            self._set_row("ufw", ("Status: active" in out) if rc == 0 else None, True)
+        else:
+            self.access_rows["ufw"].config(text="not installed", style="Dim.TLabel")
+        # SSH / VNC are only "bad" if you don't use them, so show them neutral
+        for k in ("ssh", "vnc"):
+            self.access_rows[k].config(style="TLabel")
+
+    @staticmethod
+    def autologin_on():
+        for f in ["/etc/lightdm/lightdm.conf"] + [
+                os.path.join("/etc/lightdm/lightdm.conf.d", x)
+                for x in (os.listdir("/etc/lightdm/lightdm.conf.d")
+                          if os.path.isdir("/etc/lightdm/lightdm.conf.d") else [])]:
+            try:
+                if re.search(r"^\s*autologin-user\s*=\s*\S+", open(f).read(), flags=re.M):
+                    return True
+            except Exception:
+                pass
+        try:  # greetd (newer images)
+            return "initial_session" in open("/etc/greetd/config.toml").read()
+        except Exception:
+            pass
+        if os.path.exists("/etc/lightdm") or os.path.exists("/etc/greetd"):
+            return False
+        return None
+
+    def set_autologin(self, on):
+        if not have("raspi-config"):
+            messagebox.showerror(APP_NAME, "raspi-config not found (it comes with Raspberry Pi OS).")
+            return
+        cli = run(["systemctl", "get-default"])[1].strip() == "multi-user.target"
+        # B1 console+login, B2 console autologin, B3 desktop+login, B4 desktop autologin
+        mode = ("B2" if on else "B1") if cli else ("B4" if on else "B3")
+        if not on:
+            messagebox.showinfo(APP_NAME, "After this, the Pi asks for your password at every boot.\n"
+                                          "Make sure you know it!")
+        rc, out = self.root_cmd.run(raspi("do_boot_behaviour", mode))
+        self._done(rc, out, f"Auto-login {'on' if on else 'off'} - takes effect at next boot.")
+        self.after(500, self.refresh_access)
+
+    def set_firewall(self, on):
+        if not self.root_cmd.ensure():
+            return
+        def job():
+            if not have("ufw") and not os.path.exists("/usr/sbin/ufw"):
+                rc, out = self.root_cmd.run(["apt-get", "install", "-y", "ufw"], timeout=600)
+                if rc != 0:
+                    return rc, out
+            if on:
+                for rule in (["allow", "22/tcp"], ["allow", "5900/tcp"]):
+                    self.root_cmd.run(["ufw", *rule])
+                self.root_cmd.run(["ufw", "default", "deny", "incoming"])
+                self.root_cmd.run(["ufw", "default", "allow", "outgoing"])
+                return self.root_cmd.run(["ufw", "--force", "enable"])
+            return self.root_cmd.run(["ufw", "disable"])
+        self.bg(job, f"Firewall {'on (SSH and VNC still allowed)' if on else 'off'}.",
+                "Setting up the firewall…", after=self.refresh_access)
+
+    def bg(self, job, ok_msg, busy_msg, after=None, show_output=False):
+        """Run job() in a thread so the window stays responsive."""
+        import threading
+        self.say(busy_msg)
+        result = {}
+
+        def work():
+            result["r"] = job()
+
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+
+        def poll():
+            if th.is_alive():
+                self.after(300, poll)
+                return
+            rc, out = result.get("r", (1, "failed"))
+            if rc == 0:
+                self.say(ok_msg)
+                if show_output:
+                    self.text_window(ok_msg, out)
+            else:
+                messagebox.showerror(APP_NAME, out[-1500:] or "Failed.")
+                self.say("Failed.")
+            if after:
+                after()
+        poll()
+
+    def text_window(self, title, text):
+        w = tk.Toplevel(self)
+        w.title(title)
+        w.geometry("760x420")
+        tx = tk.Text(w, wrap="none", font=("DejaVu Sans Mono", 9))
+        sb = ttk.Scrollbar(w, command=tx.yview)
+        tx.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tx.pack(fill="both", expand=True)
+        tx.insert("1.0", text or "(nothing found)")
+        tx.config(state="disabled")
+
+    def show_logins(self, failed):
+        if not self.root_cmd.ensure():
+            return
+        if failed:
+            pat = "Failed password|Invalid user|authentication failure|FAILED SU|incorrect password"
+        else:
+            pat = "Accepted (password|publickey)|session opened for user " + USER
+        def job():
+            rc, out = self.root_cmd.run(["journalctl", "--since", "-7d", "--no-pager", "-o", "short",
+                                         "-g", pat], timeout=60)
+            lines = out.splitlines()[-300:]
+            if rc == 1 and "No entries" in out or not lines:
+                return 0, "(nothing found in the last 7 days)"
+            return 0, "\n".join(lines)
+        title = "Failed logins - last 7 days" if failed else "Successful logins - last 7 days"
+        self.bg(job, title, "Reading the system log…", show_output=True)
+
+    def check_updates(self):
+        if not self.root_cmd.ensure():
+            return
+        def job():
+            rc, out = self.root_cmd.run(["apt-get", "update"], timeout=600)
+            if rc != 0:
+                return rc, out
+            rc, out = run(["apt", "list", "--upgradable"], timeout=60)
+            pk = [l for l in out.splitlines() if "/" in l]
+            self._upd_count = len(pk)
+            return 0, "\n".join(pk) or "Everything is up to date."
+
+        def done():
+            n = getattr(self, "_upd_count", None)
+            if n is not None:
+                self.upd_status.config(text=f"{n} update(s) available" if n else "✔ Everything is up to date")
+        self.bg(job, "Update check done", "Checking for updates…", after=done, show_output=True)
+
+    def install_updates(self):
+        if not messagebox.askyesno(APP_NAME, "Install all available updates now?\nThis can take several minutes."):
+            return
+        if not self.root_cmd.ensure():
+            return
+        def job():
+            self.root_cmd.run(["apt-get", "update"], timeout=600)
+            return self.root_cmd.run(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-y",
+                                      "full-upgrade"], timeout=3600)
+        def done():
+            self.upd_status.config(text="Updates installed. "
+                                   + ("Reboot needed." if os.path.exists("/var/run/reboot-required") else ""))
+        self.bg(job, "Updates installed.", "Installing updates… (the window stays usable)", after=done)
 
     # ================================================================ LOGIN ONCE
     def build_login(self):
