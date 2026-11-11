@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""pi-powerlog: logs the Raspberry Pi 5's power draw once a minute.
+
+Reads the Pi 5 power chip (vcgencmd pmic_read_adc), adds up volts x amps for
+every rail, and appends "unix_time,watts" to /var/lib/pi-security/power.csv.
+Keeps 8 days of data. Run as a service: pi-powerlog.service
+"""
+import os
+import re
+import subprocess
+import time
+
+LOG = "/var/lib/pi-security/power.csv"
+EVERY = 60          # seconds between samples
+KEEP = 8 * 86400    # seconds of history to keep
+
+
+def read_watts():
+    try:
+        out = subprocess.run(["vcgencmd", "pmic_read_adc"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return None
+    amps, volts = {}, {}
+    for name, kind, val in re.findall(r"(\S+)_(A|V)\s+\w+\(\d+\)=([\d.]+)", out):
+        (amps if kind == "A" else volts)[name] = float(val)
+    w = sum(a * volts[n] for n, a in amps.items() if n in volts)
+    return round(w, 3) if amps else None
+
+
+def prune():
+    cut = time.time() - KEEP
+    try:
+        with open(LOG) as f:
+            lines = [l for l in f if l.split(",")[0].isdigit() and int(l.split(",")[0]) >= cut]
+        tmp = LOG + ".tmp"
+        with open(tmp, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp, LOG)
+    except FileNotFoundError:
+        pass
+
+
+def main():
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    n = 0
+    while True:
+        w = read_watts()
+        if w is not None:
+            with open(LOG, "a") as f:
+                f.write(f"{int(time.time())},{w}\n")
+            os.chmod(LOG, 0o644)
+        n += 1
+        if n % 60 == 0:
+            prune()
+        time.sleep(EVERY)
+
+
+if __name__ == "__main__":
+    main()

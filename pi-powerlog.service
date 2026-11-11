@@ -1,0 +1,12 @@
+[Unit]
+Description=Pi-Performance / Security - power draw logger (once a minute)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pi-powerlog
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

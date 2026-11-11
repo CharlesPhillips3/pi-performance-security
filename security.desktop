@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Security
-Comment=Auto-lock, log in once, and clock settings
+Name=Pi-Performance / Security
+Comment=Performance, power, Turbo Disk, auto-lock, login and clock settings
 Exec=pi-security
 Icon=pi-security
 Terminal=false

@@ -1,14 +1,37 @@
-# Security for Raspberry Pi 5
+# Pi-Performance / Security for Raspberry Pi 5
 
-A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with five tabs:
+A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with seven tabs:
 
-| Auto-Lock | Sleep & Power | Access |
+| Power | Turbo Disk | Auto-Lock | Sleep |
+|---|---|---|---|
+| ![](screenshot-power.png) | ![](screenshot-disk.png) | ![](screenshot-autolock.png) | ![](screenshot-sleep.png) |
+
+| Access | Login Once | Clock |
 |---|---|---|
-| ![](screenshot-autolock.png) | ![](screenshot-power.png) | ![](screenshot-access.png) |
+| ![](screenshot-access.png) | ![](screenshot-login.png) | ![](screenshot-clock.png) |
 
-| Login Once | Clock |
-|---|---|
-| ![](screenshot-login.png) | ![](screenshot-clock.png) |
+*(The Power screenshot shows example data.)*
+
+## Power
+- **Live readout**: CPU and GPU speed, governor, temperature, power draw in watts, and under-voltage / throttling warnings.
+- **24-hour power graph** with average, min and peak watts, **kWh per day**, and estimated **cost per month and year** at your electric rate. The `pi-powerlog` service records the Pi 5's power chip once a minute, so the graph keeps filling while the app is closed. (It measures the Pi board and what it powers - a good estimate, not a wall-plug meter.)
+- **CPU & graphics profiles**:
+  - **Save Energy**: CPU at its lowest speed (`powersave`), GPU slowed to 500 MHz.
+  - **Normal**: Raspberry Pi OS default (`ondemand`), stock GPU.
+  - **Performance**: CPU always at full speed (`performance`). Optional **Overclock** to CPU 2.8 GHz and GPU 1 GHz (needs a cooler and the 27 W supply).
+  - The CPU part applies instantly and is kept across reboots. The GPU/overclock part goes in a marked block in `config.txt` (backup saved) and needs a reboot.
+- **Restart** and **Shut down** buttons.
+
+## Turbo Disk
+- Shows each NVMe drive, its model, and the PCIe link speed it's running at right now.
+- **⚡ TURBO ON** puts the NVMe at full speed in one click:
+  - **PCIe Gen 3** (about 2x faster than the default Gen 2)
+  - **Keeps the drive awake**: no deep power-saving states, so no wake-up lag
+  - **PCIe link power saving off** (ASPM)
+  - **Bigger read-ahead** (2 MB) for fast big-file copies and backups
+  - **Weekly TRIM**
+- **Turbo OFF** puts everything back to stock. You can also set each option on its own.
+- **Speed test**: reads 1 GB straight from the drive (read-only) and shows the MB/s.
 
 ## Auto-Lock
 - Lock the screen after an idle time you set in **hours and minutes**, turn the monitor off a set time (hours + minutes) after it locks, and lock before the Pi sleeps.
@@ -17,11 +40,10 @@ A small desktop app for Raspberry Pi OS (Bookworm / Trixie) with five tabs:
   X11 desktop: uses `light-locker` with the X screensaver timer.
 - Starts at every login. Adds a marked block to `~/.config/labwc/autostart` (the rest of the file is left alone).
 
-## Sleep & Power
+## Sleep
 - **Sleep ENABLED / DISABLED** for the whole Pi (masks the systemd sleep targets). When it's disabled, nothing can put the Pi to sleep, which is the safe setting for an always-on Pi (servers, RAID, hotspot). The status line shows which sleep modes your Pi supports.
 - **Put the Pi to sleep when idle** after a set time in hours + minutes (Wayland desktop; only while sleep is enabled).
 - Raspberry Pi OS **screen blanking** on/off. Turn it off if you use the monitor-off timer on the Auto-Lock tab.
-- **Restart** and **Shut down** buttons (with a confirm step).
 
 ## Access
 - **Desktop auto-login** on/off. With auto-login on, anyone who reboots the Pi gets in with no password, so the auto-lock doesn't protect you.
@@ -62,20 +84,21 @@ git clone https://github.com/CharlesPhillips3/security.git
 cd security
 bash install.sh
 ```
-Open it from **Menu → Preferences → Security**, or run `pi-security`.
+Open it from **Menu → Preferences → Pi-Performance / Security**, or run `pi-security`.
 Log out and back in once after installing so the keyring unlocks at login.
 
 ## Uninstall
 ```bash
 bash uninstall.sh
 ```
-This removes the app, its autostart entry, the saved keyring password, and its sudoers/polkit rules, and re-enables sleep. Auto-login, SSH, VNC, firewall and RTC settings stay as you left them.
+This removes the app, its autostart entry, the saved keyring password, and its sudoers/polkit rules, the power logger and its data, and re-enables sleep. Put Power on **Normal** and Turbo Disk **OFF** first if you want stock boot settings back. Auto-login, SSH, VNC, firewall and RTC settings stay as you left them.
 
 ## Files
 | File | What it is |
 |---|---|
 | `security.py` | The app (Python 3 + Tkinter) |
 | `pi-sudo` | Runs sudo with the password saved in the keyring |
+| `pi-powerlog`, `pi-powerlog.service` | Background power-draw logger for the 24-hour graph |
 | `install.sh` / `uninstall.sh` | Installer / remover |
 | `security.desktop`, `security.png` | Menu entry and icon |
 

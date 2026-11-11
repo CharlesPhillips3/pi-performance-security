@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Security - auto-lock, log-in-once and clock settings for Raspberry Pi 5.
+Pi-Performance / Security - performance, power and security settings for Raspberry Pi 5.
 
 Tabs:
   Auto-Lock  - lock the desktop after an idle time in hours + minutes (swayidle +
@@ -19,11 +19,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_NAME = "Security"
-VERSION = "1.2.0"
+APP_NAME = "Pi-Performance / Security"
+VERSION = "1.4.0"
 USER = getpass.getuser()
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(HOME, ".config", "pi-security")
@@ -102,6 +103,33 @@ INFO = {
              "last 7 days, so you can spot someone trying to get in.",
     "updates": "Checks for and installs software updates (apt full-upgrade). "
                "Keeping the Pi updated is the best single security step.",
+    "powergraph": "Power draw of the Pi 5 board, measured by its own power chip once a minute "
+                  "by the pi-powerlog service (it keeps logging while this app is closed). "
+                  "It counts the Pi itself - the CPU, memory, USB and NVMe rails it powers - so it's a "
+                  "good estimate, but not the same as a wall-plug meter (it leaves out power supply losses "
+                  "and anything with its own power). kWh/day = average watts x 24 / 1000.",
+    "overclock": "Adds arm_freq=2800 (CPU 2.4 to 2.8 GHz) and gpu_freq=1000 to config.txt. "
+                 "Needs a fan / active cooler and the official 27 W power supply. If the "
+                 "Pi won't boot, hold SHIFT at boot or remove those lines from config.txt "
+                 "on another computer. A backup is saved as config.txt.bak-security.",
+    "throttle": "If the Pi gets too hot (about 80-85 C) or the power supply is too weak, "
+                "the firmware slows it down. 'Under-voltage' means use a better supply.",
+    "gen3": "The Pi 5's PCIe slot runs at Gen 2 (about 450 MB/s) by default. Gen 3 roughly "
+            "doubles NVMe speed (about 800-900 MB/s). It isn't officially certified, "
+            "but works with most NVMe HATs and drives. Needs a reboot. If the drive "
+            "acts up, turn it back off.",
+    "apst": "NVMe drives drop into deep power-saving states when idle, which adds "
+            "lag when they wake up. This keeps the drive fully awake "
+            "(nvme_core.default_ps_max_latency_us=0 in cmdline.txt). Needs a reboot.",
+    "aspm": "PCIe link power saving (ASPM). Turning it off keeps the PCIe link at full "
+            "power - smoother speed, a little more power use. Needs a reboot.",
+    "readahead": "How much the kernel reads ahead on big sequential reads. "
+                 "Bigger = faster large file copies and backups. Changes right away "
+                 "and is kept after a reboot.",
+    "trim": "Weekly TRIM tells the SSD which blocks are free, keeping it fast "
+            "over time (systemd fstrim.timer).",
+    "speedtest": "Reads 1 GB straight from the drive (read-only - it doesn't change "
+                 "anything) to measure its real speed.",
     "ntp": "Network time keeps the clock correct automatically from the internet "
            "(systemd-timesyncd). Turn it off only if you want to set the time by hand.",
     "rtc": "The Pi 5 has a built-in real-time clock. With a battery on the J5 'BAT' "
@@ -154,6 +182,86 @@ def keyring_get():
         return None
     rc, out = run(["secret-tool", "lookup", *KEYRING_ATTRS])
     return out if rc == 0 and out else None
+
+
+BOOT = "/boot/firmware" if os.path.isdir("/boot/firmware") else "/boot"
+CONFIG_TXT = os.path.join(BOOT, "config.txt")
+CMDLINE_TXT = os.path.join(BOOT, "cmdline.txt")
+POWER_HELPER = "/usr/local/sbin/pi-security-power"
+POWER_UNIT = "/etc/systemd/system/pi-security-power.service"
+POWER_STATE = "/etc/pi-security"
+POWER_LOG = "/var/lib/pi-security/power.csv"
+
+
+def pmic_watts():
+    """Pi 5 board power from the PMIC: sum of volts x amps over every rail (None if unavailable)."""
+    out = vc("pmic_read_adc")
+    amps, volts = {}, {}
+    for name, kind, val in re.findall(r"(\S+)_(A|V)\s+\w+\(\d+\)=([\d.]+)", out):
+        (amps if kind == "A" else volts)[name] = float(val)
+    return sum(a * volts[n] for n, a in amps.items() if n in volts) if amps else None
+
+
+def power_history(hours=24):
+    cut = time.time() - hours * 3600
+    pts = []
+    try:
+        with open(POWER_LOG) as f:
+            for line in f:
+                t, _, w = line.strip().partition(",")
+                if t.isdigit() and int(t) >= cut:
+                    try:
+                        pts.append((int(t), float(w)))
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return pts
+
+# CPU/GPU profiles. governor = live (no reboot); config = lines put in config.txt (reboot)
+PROFILES = {
+    "save": {"name": "Save Energy", "governor": "powersave",
+             "config": ["# Save Energy: CPU held at its lowest speed, GPU slowed down",
+                        "gpu_freq=500"],
+             "desc": "Lowest CPU speed and a slower GPU. Runs cooler and quieter and "
+                     "uses the least power - fine for servers, RAID, hotspot and "
+                     "background jobs."},
+    "normal": {"name": "Normal", "governor": "ondemand", "config": [],
+               "desc": "Raspberry Pi OS default. The CPU speeds up when there's work "
+                       "and slows down when idle. Stock GPU speed."},
+    "perf": {"name": "Performance", "governor": "performance",
+             "config": ["# Performance: CPU always at full speed"],
+             "desc": "CPU stays at full speed all the time - snappier desktop, faster "
+                     "builds, but more heat and power. Tick 'Overclock' for even more."},
+}
+INFO["profile"] = ("\n\n".join(f"{p['name']}: {p['desc']}" for p in PROFILES.values())
+                   + "\n\nThe CPU part changes right away and is kept after a reboot. "
+                     "The GPU part goes in config.txt and needs a reboot.")
+OVERCLOCK = ["# Overclock (needs good cooling and the 27 W power supply)",
+             "arm_freq=2800", "gpu_freq=1000"]
+
+
+def read_sys(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def vc(*args):
+    rc, out = run(["vcgencmd", *args])
+    return out if rc == 0 else ""
+
+
+def nvme_devices():
+    """[(name, pci_dir)] for each NVMe drive."""
+    out = []
+    base = "/sys/class/nvme"
+    for n in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        dev = os.path.realpath(os.path.join(base, n, "device"))
+        out.append((n, dev))
+    return out
 
 
 SLEEP_TARGETS = ["sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target"]
@@ -243,7 +351,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME}")
-        self.geometry("720x800")
+        self.geometry("800x820")
         self.minsize(560, 420)
         self.s = load_settings()
         self.root_cmd = Root(self)
@@ -251,25 +359,28 @@ class App(tk.Tk):
 
         head = ttk.Frame(self, padding=(16, 12, 16, 4))
         head.pack(fill="x")
-        ttk.Label(head, text="\U0001F512  Security", style="H1.TLabel").pack(side="left")
+        ttk.Label(head, text="\U0001F512  Pi-Performance / Security", style="H1.TLabel").pack(side="left")
         ttk.Label(head, text=f"v{VERSION} · {USER} · {session_type()}",
                   style="Dim.TLabel").pack(side="right")
 
         self.nb = nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=12, pady=(4, 0))
         pages = []
-        for name in ("  Auto-Lock  ", "  Sleep & Power  ", "  Access  ", "  Login Once  ", "  Clock  "):
+        for name in (" Auto-Lock ", " Sleep ", " Power ", " Turbo Disk ", " Access ", " Login Once ", " Clock "):
             outer, inner = self._scroller(nb)
             nb.add(outer, text=name)
             pages.append(inner)
-        self.tab_lock, self.tab_power, self.tab_access, self.tab_login, self.tab_clock = pages
+        (self.tab_lock, self.tab_sleep, self.tab_power, self.tab_disk,
+         self.tab_access, self.tab_login, self.tab_clock) = pages
 
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status, style="Status.TLabel",
                   anchor="w", padding=(14, 6)).pack(fill="x", side="bottom")
 
         self.build_lock()
+        self.build_sleep()
         self.build_power()
+        self.build_disk()
         self.build_access()
         self.build_login()
         self.build_clock()
@@ -572,8 +683,8 @@ fi
             messagebox.showwarning(APP_NAME, "No lock tool found. Press 'Install lock tools'.")
 
     # ================================================================ SLEEP & POWER
-    def build_power(self):
-        t = self.tab_power
+    def build_sleep(self):
+        t = self.tab_sleep
         box = ttk.Labelframe(t, text="System sleep", style="Card.TLabelframe")
         box.pack(fill="x")
         r = ttk.Frame(box); r.pack(fill="x")
@@ -600,12 +711,6 @@ fi
         ttk.Button(r, text="Blanking OFF", command=lambda: self.raspi_toggle("do_blanking", False, "Screen blanking")).pack(side="left", padx=6)
         self.info_btn(r, "blank").pack(side="right")
 
-        pw = ttk.Labelframe(t, text="Power", style="Card.TLabelframe")
-        pw.pack(fill="x", pady=(10, 0))
-        r = ttk.Frame(pw); r.pack(fill="x")
-        ttk.Button(r, text="Restart", command=lambda: self.power("reboot")).pack(side="left")
-        ttk.Button(r, text="Shut down", command=lambda: self.power("poweroff")).pack(side="left", padx=6)
-        self.info_btn(r, "power").pack(side="right")
         self.refresh_power()
 
     def refresh_power(self):
@@ -653,6 +758,436 @@ fi
             rc, out = self.root_cmd.run(["systemctl", what])
             if rc != 0:
                 messagebox.showerror(APP_NAME, out)
+
+    # ================================================================ POWER (CPU / GPU)
+    def build_power(self):
+        t = self.tab_power
+        live = ttk.Labelframe(t, text="Right now", style="Card.TLabelframe")
+        live.pack(fill="x")
+        self.pw_live = ttk.Label(live, text="", font=("DejaVu Sans Mono", 10), justify="left")
+        self.pw_live.pack(anchor="w", side="left")
+        self.info_btn(live, "throttle").pack(side="right", anchor="n")
+
+        gr = ttk.Labelframe(t, text="Power draw - last 24 hours", style="Card.TLabelframe")
+        gr.pack(fill="x", pady=(10, 0))
+        self.pg = tk.Canvas(gr, height=190, bg="#ffffff", highlightthickness=1,
+                            highlightbackground="#d1d5db")
+        self.pg.pack(fill="x")
+        self.pg.bind("<Configure>", lambda e: self.draw_power_graph())
+        r = ttk.Frame(gr); r.pack(fill="x", pady=(6, 0))
+        self.pg_avg = ttk.Label(r, text="", style="Ok.TLabel")
+        self.pg_avg.pack(side="left")
+        self.info_btn(r, "powergraph").pack(side="right")
+        r = ttk.Frame(gr); r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text="Electric rate $/kWh:").pack(side="left")
+        self.v_rate = tk.StringVar(value=str(self.s.get("rate", 0.19)))
+        e = ttk.Entry(r, textvariable=self.v_rate, width=7)
+        e.pack(side="left", padx=6)
+        e.bind("<KeyRelease>", lambda ev: self.draw_power_graph())
+        self.pg_cost = ttk.Label(r, text="", style="Dim.TLabel")
+        self.pg_cost.pack(side="left", padx=6)
+        self.pg_btn = ttk.Button(r, text="Start power logger", command=self.start_logger)
+        self.pg_btn.pack(side="right")
+
+        box = ttk.Labelframe(t, text="CPU & graphics profile", style="Card.TLabelframe")
+        box.pack(fill="x", pady=(10, 0))
+        top = ttk.Frame(box); top.pack(fill="x")
+        ttk.Label(top, text="Pick one, then press Apply:", style="Dim.TLabel").pack(side="left")
+        self.info_btn(top, "profile").pack(side="right")
+        self.v_profile = tk.StringVar(value=self.s.get("profile", "normal"))
+        for key, p in PROFILES.items():
+            r = ttk.Frame(box); r.pack(fill="x", pady=2)
+            ttk.Radiobutton(r, text=p["name"], value=key, variable=self.v_profile, width=14).pack(side="left")
+            ttk.Label(r, text=p["desc"], style="Dim.TLabel", wraplength=560, justify="left").pack(side="left")
+        r = ttk.Frame(box); r.pack(fill="x", pady=(6, 0))
+        self.v_oc = tk.BooleanVar(value=self.s.get("overclock", False))
+        ttk.Checkbutton(r, text="Overclock with Performance (CPU 2.8 GHz, GPU 1 GHz)",
+                        variable=self.v_oc).pack(side="left")
+        self.info_btn(r, "overclock").pack(side="right")
+        r = ttk.Frame(box); r.pack(fill="x", pady=(8, 0))
+        ttk.Button(r, text="Apply", style="Accent.TButton", command=self.apply_profile).pack(side="left")
+        self.pw_note = ttk.Label(r, text="", style="Dim.TLabel")
+        self.pw_note.pack(side="left", padx=10)
+
+        pw = ttk.Labelframe(t, text="Restart / shut down", style="Card.TLabelframe")
+        pw.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(pw); r.pack(fill="x")
+        ttk.Button(r, text="Restart", command=lambda: self.power("reboot")).pack(side="left")
+        ttk.Button(r, text="Shut down", command=lambda: self.power("poweroff")).pack(side="left", padx=6)
+        self.info_btn(r, "power").pack(side="right")
+        self.power_tick()
+
+    def power_tick(self):
+        pol = "/sys/devices/system/cpu/cpufreq/policy0"
+        gov = read_sys(pol + "/scaling_governor", "?")
+        cur = read_sys(pol + "/scaling_cur_freq")
+        mx = read_sys(pol + "/cpuinfo_max_freq")
+        arm = vc("measure_clock", "arm")
+        arm_mhz = int(arm.split("=")[1]) // 1_000_000 if "=" in arm else (int(cur) // 1000 if cur else 0)
+        v3d = vc("measure_clock", "v3d")
+        v3d_mhz = int(v3d.split("=")[1]) // 1_000_000 if "=" in v3d else None
+        temp = vc("measure_temp").replace("temp=", "").replace("'C", " C")
+        if not temp:
+            t = read_sys("/sys/class/thermal/thermal_zone0/temp")
+            temp = f"{int(t) / 1000:.1f} C" if t else "?"
+        thr = vc("get_throttled")
+        flags = []
+        if "=" in thr:
+            v = int(thr.split("=")[1], 16)
+            if v & 0x1: flags.append("UNDER-VOLTAGE now")
+            if v & 0x4: flags.append("THROTTLED now")
+            if v & 0x8: flags.append("too hot now")
+            if v & 0x10000 and not v & 0x1: flags.append("under-voltage since boot")
+            if v & 0x40000 and not v & 0x4: flags.append("throttled since boot")
+        lines = [f"CPU   {arm_mhz:>5} MHz   (max {int(mx) // 1000 if mx else '?'} MHz)   governor: {gov}",
+                 f"GPU   {str(v3d_mhz) + ' MHz' if v3d_mhz else 'n/a':>9}",
+                 f"Temp  {temp:>9}",
+                 f"Draw  {(f'{w:.2f} W') if (w := pmic_watts()) is not None else 'n/a':>9}",
+                 "Power " + ("✔ OK" if not flags and thr else ", ".join(flags) if flags else "n/a (vcgencmd not found)")]
+        self.pw_live.config(text="\n".join(lines))
+        self._pt = getattr(self, "_pt", 0) + 1
+        if self._pt % 30 == 1:  # graph once a minute
+            self.draw_power_graph()
+        self.after(2000, self.power_tick)
+
+    def logger_running(self):
+        return run(["systemctl", "is-active", "pi-powerlog"])[1] == "active"
+
+    def start_logger(self):
+        src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-powerlog")
+        if not os.path.exists("/usr/local/sbin/pi-powerlog"):
+            if not os.path.exists(src):
+                messagebox.showerror(APP_NAME, "pi-powerlog not found - re-run install.sh.")
+                return
+            self.root_cmd.run(["install", "-m", "0755", src, "/usr/local/sbin/pi-powerlog"])
+            unit = src + ".service"
+            if os.path.exists(unit):
+                self.root_cmd.run(["install", "-m", "0644", unit, "/etc/systemd/system/pi-powerlog.service"])
+            self.root_cmd.run(["systemctl", "daemon-reload"])
+        rc, out = self.root_cmd.run(["systemctl", "enable", "--now", "pi-powerlog"])
+        self._done(rc, out, "Power logger running - the graph fills in over the next 24 hours.")
+        self.draw_power_graph()
+
+    def draw_power_graph(self):
+        c = self.pg
+        c.delete("all")
+        W, H = max(c.winfo_width(), 300), int(c.cget("height"))
+        L, R, T, B = 44, 10, 10, 22
+        pts = power_history(24)
+        now = time.time()
+        running = self.logger_running()
+        self.pg_btn.pack_forget() if running else self.pg_btn.pack(side="right")
+        if len(pts) < 2:
+            c.create_text(W / 2, H / 2, fill="#6b7280",
+                          text=("Collecting data… first points show up in a few minutes."
+                                if running else "No data yet - press 'Start power logger'."))
+            self.pg_avg.config(text="")
+            self.pg_cost.config(text="")
+            return
+        ws = [w for _, w in pts]
+        hi = max(ws) * 1.15 or 1
+        hi = max(1, (int(hi) + 1))
+        x = lambda t: L + (t - (now - 86400)) / 86400 * (W - L - R)
+        y = lambda w: T + (1 - w / hi) * (H - T - B)
+        # grid
+        for i in range(0, 5):
+            wv = hi * i / 4
+            c.create_line(L, y(wv), W - R, y(wv), fill="#eef0f3")
+            c.create_text(L - 6, y(wv), text=f"{wv:.1f}W", anchor="e", fill="#6b7280", font=("DejaVu Sans", 8))
+        for h in range(0, 25, 6):
+            tx = now - 86400 + h * 3600
+            c.create_line(x(tx), T, x(tx), H - B, fill="#eef0f3")
+            lbl = "now" if h == 24 else time.strftime("%I %p", time.localtime(tx)).lstrip("0")
+            c.create_text(x(tx), H - B + 11, text=lbl, fill="#6b7280", font=("DejaVu Sans", 8),
+                          anchor="e" if h == 24 else "center")
+        # area + line (gaps > 5 min break the line)
+        seg = []
+        segs = [seg]
+        for (t0, w0), (t1, _) in zip(pts, pts[1:] + [pts[-1]]):
+            seg.append((x(t0), y(w0)))
+            if t1 - t0 > 300:
+                seg = []
+                segs.append(seg)
+        for sg in segs:
+            if len(sg) >= 2:
+                poly = [sg[0][0], y(0)] + [v for p in sg for v in p] + [sg[-1][0], y(0)]
+                c.create_polygon(poly, fill="#fbe3ea", outline="")
+                c.create_line([v for p in sg for v in p], fill="#c51a4a", width=2)
+        # average (time-weighted is ~ the plain mean at a steady 1/min)
+        avg = sum(ws) / len(ws)
+        c.create_line(L, y(avg), W - R, y(avg), fill="#1d2430", dash=(4, 3))
+        tid = c.create_text(L + 6, y(avg) - 9, text=f"avg {avg:.2f} W", anchor="w",
+                            fill="#1d2430", font=("DejaVu Sans", 8, "bold"))
+        bb = c.bbox(tid)
+        c.tag_lower(c.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1,
+                                       fill="#ffffff", outline="#d1d5db"), tid)
+        span_h = (pts[-1][0] - pts[0][0]) / 3600
+        kwh_day = avg * 24 / 1000
+        self.pg_avg.config(text=f"Average {avg:.2f} W   ·   min {min(ws):.2f} W   ·   peak {max(ws):.2f} W"
+                                f"   ·   ≈ {kwh_day:.3f} kWh/day" + (f"   ({span_h:.1f} h of data)" if span_h < 23.5 else ""))
+        try:
+            rate = float(self.v_rate.get())
+            self.s["rate"] = rate
+            save_settings(self.s)
+            self.pg_cost.config(text=f"≈ ${kwh_day * rate * 30:.2f}/month   ·   ${kwh_day * rate * 365:.2f}/year")
+        except ValueError:
+            self.pg_cost.config(text="")
+
+    def _boot_text(self, path):
+        try:
+            return open(path).read()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Can't read {path}:\n{e}")
+            return None
+
+    def _boot_write(self, path, text):
+        self.root_cmd.run(["cp", "-n", path, path + ".bak-security"])
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(text)
+        rc, out = self.root_cmd.run(["cp", tf.name, path])
+        os.unlink(tf.name)
+        return rc, out
+
+    def config_block(self, name, lines):
+        """Put lines in a marked block in config.txt (under [all]); [] removes the block.
+        Returns True if the file changed."""
+        txt = self._boot_text(CONFIG_TXT)
+        if txt is None:
+            return False
+        b, e = f"# >>> pi-security {name} >>>", f"# <<< pi-security {name} <<<"
+        new = re.sub(re.escape(b) + r".*?" + re.escape(e) + r"\n?", "", txt, flags=re.S)
+        if lines:
+            if not new.endswith("\n"):
+                new += "\n"
+            new += "\n".join([b, "[all]", *lines, e]) + "\n"
+        if new == txt:
+            return False
+        rc, out = self._boot_write(CONFIG_TXT, new)
+        if rc != 0:
+            messagebox.showerror(APP_NAME, out)
+            return False
+        return True
+
+    def cmdline_flag(self, token, on):
+        """Add/remove one kernel option in cmdline.txt (a single line). Returns True if changed."""
+        txt = self._boot_text(CMDLINE_TXT)
+        if txt is None:
+            return False
+        key = token.split("=")[0]
+        parts = [x for x in txt.split() if x.split("=")[0] != key]
+        if on:
+            parts.append(token)
+        new = " ".join(parts) + "\n"
+        if new.split() == txt.split():
+            return False
+        rc, out = self._boot_write(CMDLINE_TXT, new)
+        if rc != 0:
+            messagebox.showerror(APP_NAME, out)
+            return False
+        return True
+
+    def ensure_power_service(self):
+        """Boot-time helper that re-applies the CPU governor and NVMe read-ahead."""
+        helper = f"""#!/bin/sh
+# Installed by the Security app - re-applies CPU profile and NVMe read-ahead at boot.
+G=$(cat {POWER_STATE}/governor 2>/dev/null)
+if [ -n "$G" ]; then
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$G" > "$p/scaling_governor" 2>/dev/null; done
+fi
+RA=$(cat {POWER_STATE}/nvme-readahead 2>/dev/null)
+if [ -n "$RA" ]; then
+  for d in /sys/block/nvme*n*; do [ -e "$d/queue/read_ahead_kb" ] && echo "$RA" > "$d/queue/read_ahead_kb"; done
+fi
+exit 0
+"""
+        unit = f"""[Unit]
+Description=Security app - CPU profile and NVMe tuning
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart={POWER_HELPER}
+
+[Install]
+WantedBy=multi-user.target
+"""
+        self.root_cmd.run(["mkdir", "-p", POWER_STATE])
+        self.root_cmd.write_file(POWER_HELPER, helper, "0755")
+        self.root_cmd.write_file(POWER_UNIT, unit, "0644")
+        self.root_cmd.run(["systemctl", "daemon-reload"])
+        self.root_cmd.run(["systemctl", "enable", "pi-security-power.service"])
+
+    def set_state(self, name, value):
+        self.root_cmd.run(["mkdir", "-p", POWER_STATE])
+        if value is None:
+            return self.root_cmd.run(["rm", "-f", os.path.join(POWER_STATE, name)])
+        return self.root_cmd.write_file(os.path.join(POWER_STATE, name), str(value) + "\n", "0644")
+
+    def apply_profile(self):
+        key = self.v_profile.get()
+        p = PROFILES[key]
+        oc = self.v_oc.get() and key == "perf"
+        if oc and not messagebox.askyesno(APP_NAME, INFO["overclock"] + "\n\nOverclock?"):
+            return
+        if not self.root_cmd.ensure():
+            return
+        avail = read_sys("/sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors").split()
+        gov = p["governor"] if (not avail or p["governor"] in avail) else ("schedutil" if "schedutil" in avail else avail[0])
+        # live change, every CPU cluster
+        for pol in sorted(os.listdir("/sys/devices/system/cpu/cpufreq")) if os.path.isdir("/sys/devices/system/cpu/cpufreq") else []:
+            if pol.startswith("policy"):
+                self.root_cmd.run(["sh", "-c", f"echo {gov} > /sys/devices/system/cpu/cpufreq/{pol}/scaling_governor"])
+        self.set_state("governor", gov)
+        self.ensure_power_service()
+        lines = p["config"] + (OVERCLOCK if oc else [])
+        if all(l.startswith("#") for l in lines):
+            lines = []  # nothing but comments - leave config.txt alone
+        changed = self.config_block("power", lines)
+        self.s.update(profile=key, overclock=oc)
+        save_settings(self.s)
+        msg = f"{p['name']} profile on (CPU governor: {gov})."
+        if changed:
+            msg += " Reboot to apply the GPU / overclock part."
+            self.pw_note.config(text="Reboot needed for the config.txt part")
+        else:
+            self.pw_note.config(text="")
+        self.say(msg)
+
+    # ================================================================ TURBO DISK
+    def build_disk(self):
+        t = self.tab_disk
+        st = ttk.Labelframe(t, text="Your NVMe drives", style="Card.TLabelframe")
+        st.pack(fill="x")
+        self.disk_info = ttk.Label(st, text="", font=("DejaVu Sans Mono", 10), justify="left")
+        self.disk_info.pack(anchor="w")
+
+        tb = ttk.Labelframe(t, text="Turbo Disk", style="Card.TLabelframe")
+        tb.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(tb); r.pack(fill="x")
+        ttk.Button(r, text="⚡ TURBO ON (full speed)", style="Accent.TButton",
+                   command=lambda: self.turbo(True)).pack(side="left")
+        ttk.Button(r, text="Turbo OFF (stock)", command=lambda: self.turbo(False)).pack(side="left", padx=6)
+        ttk.Label(tb, text="Turbo ON = all of the options below. Or set them one at a time:",
+                  style="Dim.TLabel").pack(anchor="w", pady=(6, 4))
+
+        self.v_gen3 = tk.BooleanVar(value=self.gen3_on())
+        self.v_apst = tk.BooleanVar(value=self.cmd_has("nvme_core.default_ps_max_latency_us"))
+        self.v_aspm = tk.BooleanVar(value=self.cmd_has("pcie_aspm"))
+        ra = read_sys(POWER_STATE + "/nvme-readahead")
+        self.v_ra = tk.StringVar(value=ra or "128")
+        self.v_trim = tk.BooleanVar(value=run(["systemctl", "is-enabled", "fstrim.timer"])[1] == "enabled")
+        for var, text, key in ((self.v_gen3, "PCIe Gen 3 (about 2x faster)", "gen3"),
+                               (self.v_apst, "Keep the drive awake (no deep power saving)", "apst"),
+                               (self.v_aspm, "PCIe link power saving OFF", "aspm"),
+                               (self.v_trim, "Weekly TRIM (keeps the SSD fast)", "trim")):
+            r = ttk.Frame(tb); r.pack(fill="x", pady=1)
+            ttk.Checkbutton(r, text=text, variable=var).pack(side="left")
+            self.info_btn(r, key).pack(side="right")
+        r = ttk.Frame(tb); r.pack(fill="x", pady=1)
+        ttk.Label(r, text="Read-ahead (KB):").pack(side="left")
+        ttk.Combobox(r, textvariable=self.v_ra, values=["128", "512", "1024", "2048", "4096"],
+                     width=7).pack(side="left", padx=6)
+        self.info_btn(r, "readahead").pack(side="right")
+        r = ttk.Frame(tb); r.pack(fill="x", pady=(8, 0))
+        ttk.Button(r, text="Apply", command=self.apply_disk).pack(side="left")
+        self.disk_note = ttk.Label(r, text="", style="Dim.TLabel")
+        self.disk_note.pack(side="left", padx=10)
+
+        sp = ttk.Labelframe(t, text="Speed test", style="Card.TLabelframe")
+        sp.pack(fill="x", pady=(10, 0))
+        r = ttk.Frame(sp); r.pack(fill="x")
+        ttk.Button(r, text="Test read speed", command=self.speed_test).pack(side="left")
+        self.speed_lbl = ttk.Label(r, text="", style="Ok.TLabel")
+        self.speed_lbl.pack(side="left", padx=10)
+        self.info_btn(r, "speedtest").pack(side="right")
+        self.refresh_disk()
+
+    def cmd_has(self, key):
+        return any(x.split("=")[0] == key for x in read_sys(CMDLINE_TXT).split())
+
+    def gen3_on(self):
+        return bool(re.search(r"^\s*dtparam=pciex1_gen=3", read_sys(CONFIG_TXT), flags=re.M))
+
+    def refresh_disk(self):
+        gens = {"2.5": "Gen 1", "5.0": "Gen 2", "8.0": "Gen 3", "16.0": "Gen 4"}
+        lines = []
+        for name, dev in nvme_devices():
+            model = read_sys(f"/sys/class/nvme/{name}/model", "NVMe drive")
+            spd = read_sys(os.path.join(dev, "current_link_speed"))
+            mx = read_sys(os.path.join(dev, "max_link_speed"))
+            w = read_sys(os.path.join(dev, "current_link_width"))
+            g = gens.get(spd.split()[0], "?") if spd else "?"
+            gm = gens.get(mx.split()[0], "?") if mx else "?"
+            lines.append(f"{name}: {model[:34]}")
+            lines.append(f"   link now: {g} x{w or '?'} ({spd or '?'})   drive supports: {gm}")
+        if not lines:
+            lines = ["No NVMe drive found."]
+        ra = read_sys("/sys/block/nvme0n1/queue/read_ahead_kb")
+        lines.append(f"Config: Gen 3 {'ON' if self.gen3_on() else 'off'} · "
+                     f"stay awake {'ON' if self.cmd_has('nvme_core.default_ps_max_latency_us') else 'off'} · "
+                     f"ASPM {'OFF' if self.cmd_has('pcie_aspm') else 'on'} · read-ahead {ra or '?'} KB")
+        self.disk_info.config(text="\n".join(lines))
+
+    def turbo(self, on):
+        self.v_gen3.set(on); self.v_apst.set(on); self.v_aspm.set(on); self.v_trim.set(True)
+        self.v_ra.set("2048" if on else "128")
+        self.apply_disk()
+
+    def apply_disk(self):
+        try:
+            ra = int(self.v_ra.get())
+        except ValueError:
+            messagebox.showerror(APP_NAME, "Read-ahead must be a number (KB).")
+            return
+        if self.v_gen3.get() and not self.gen3_on():
+            if not messagebox.askyesno(APP_NAME, INFO["gen3"] + "\n\nTurn on PCIe Gen 3?"):
+                self.v_gen3.set(False)
+        if not self.root_cmd.ensure():
+            return
+        reboot = False
+        reboot |= self.config_block("pcie", ["dtparam=pciex1", "dtparam=pciex1_gen=3"] if self.v_gen3.get() else [])
+        reboot |= self.cmdline_flag("nvme_core.default_ps_max_latency_us=0", self.v_apst.get())
+        reboot |= self.cmdline_flag("pcie_aspm=off", self.v_aspm.get())
+        # read-ahead: live + kept at boot
+        for d in os.listdir("/sys/block") if os.path.isdir("/sys/block") else []:
+            if d.startswith("nvme"):
+                self.root_cmd.run(["sh", "-c", f"echo {ra} > /sys/block/{d}/queue/read_ahead_kb"])
+        self.set_state("nvme-readahead", ra if ra != 128 else None)
+        self.ensure_power_service()
+        self.root_cmd.run(["systemctl", "enable" if self.v_trim.get() else "disable", "--now", "fstrim.timer"])
+        self.refresh_disk()
+        if reboot:
+            self.disk_note.config(text="Reboot to finish (boot files changed)")
+            if messagebox.askyesno(APP_NAME, "Disk settings saved. Some need a reboot.\nRestart now?"):
+                self.root_cmd.run(["systemctl", "reboot"])
+        else:
+            self.disk_note.config(text="")
+        self.say("Disk settings applied.")
+
+    def speed_test(self):
+        devs = [d for d in (os.listdir("/sys/block") if os.path.isdir("/sys/block") else [])
+                if re.fullmatch(r"nvme\d+n\d+", d)]
+        if not devs:
+            messagebox.showinfo(APP_NAME, "No NVMe drive found.")
+            return
+        if not self.root_cmd.ensure():
+            return
+        dev = "/dev/" + devs[0]
+        result = {}
+
+        def job():
+            import time
+            t0 = time.monotonic()
+            rc, out = self.root_cmd.run(["dd", f"if={dev}", "of=/dev/null", "bs=4M", "count=256",
+                                         "iflag=direct", "status=none"], timeout=120)
+            result["secs"] = max(0.001, time.monotonic() - t0)
+            return rc, out
+
+        def done():
+            if "secs" in result:
+                self.speed_lbl.config(text=f"{dev}: about {1024 / result['secs']:.0f} MB/s read")
+        self.speed_lbl.config(text="testing…")
+        self.bg(job, f"Speed test done on {dev}.", "Reading 1 GB from the drive…", after=done)
 
     # ================================================================ ACCESS
     def build_access(self):

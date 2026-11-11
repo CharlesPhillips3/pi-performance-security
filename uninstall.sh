@@ -8,7 +8,13 @@ command -v secret-tool >/dev/null && secret-tool clear service pi-security user 
 sudo rm -f /etc/sudoers.d/60-pi-security /etc/polkit-1/rules.d/49-pi-security.rules \
   /usr/local/bin/pi-security /usr/local/bin/pi-sudo /usr/share/applications/pi-security.desktop \
   /usr/share/icons/hicolor/128x128/apps/pi-security.png
-sudo rm -rf /opt/pi-security
+sudo systemctl disable pi-security-power.service 2>/dev/null
+sudo systemctl disable --now pi-powerlog.service 2>/dev/null
+sudo rm -f /etc/systemd/system/pi-powerlog.service /usr/local/sbin/pi-powerlog
+sudo rm -rf /var/lib/pi-security
+sudo rm -f /etc/systemd/system/pi-security-power.service /usr/local/sbin/pi-security-power
+sudo rm -rf /opt/pi-security /etc/pi-security
+sudo systemctl daemon-reload
 sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
 rm -rf ~/.config/pi-security
-echo "Security app removed. (Sleep is re-enabled. RTC charging, auto-login, SSH, VNC and firewall settings are left as they are.)"
+echo "Pi-Performance / Security removed. (Sleep is re-enabled. CPU profile / Turbo Disk boot settings (config.txt, cmdline.txt), RTC charging, auto-login, SSH, VNC and firewall settings are left as they are.)"
